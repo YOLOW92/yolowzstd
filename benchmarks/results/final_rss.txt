@@ -1,0 +1,11 @@
+dec	yolow	mozilla	L3	before_kib=72468	after_kib=121872	delta_kib=49404	ms=87.88
+dec	c_libzstd	mozilla	L3	before_kib=72532	after_kib=121928	delta_kib=49396	ms=54.57
+dec	rust_zstd	mozilla	L3	before_kib=72500	after_kib=122024	delta_kib=49524	ms=61.92
+dec	zstd_pure_rs	mozilla	L3	before_kib=72532	after_kib=121928	delta_kib=49396	ms=83.65
+dec	structured	mozilla	L3	before_kib=72600	after_kib=122256	delta_kib=49656	ms=80.37
+dec	ruzstd	mozilla	L3	before_kib=72628	after_kib=128448	delta_kib=55820	ms=249.60
+enc	yolow	mozilla	L3	before_kib=72652	after_kib=92352	delta_kib=19700	ms=315.64
+enc	c_libzstd	mozilla	L3	before_kib=72536	after_kib=90576	delta_kib=18040	ms=250.34
+enc	rust_zstd	mozilla	L3	before_kib=72524	after_kib=90944	delta_kib=18420	ms=278.30
+enc	zstd_pure_rs	mozilla	L3	before_kib=72468	after_kib=90888	delta_kib=18420	ms=331.40
+enc	structured	mozilla	L3	before_kib=72624	after_kib=92088	delta_kib=19464	ms=231.82

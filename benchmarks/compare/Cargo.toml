@@ -1,0 +1,24 @@
+[package]
+name = "yolowzstd-compare"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+yolowzstd = { path = "../.." }
+zstd = { version = "0.14", features = ["zstdmt"] }
+ruzstd = "0.9"
+zstd-pure-rs = "0.2"
+rust-zstd = { version = "0.4", default-features = false }
+oxiarc-zstd = "0.4"
+structured-zstd = "0.3"
+zstd-rs = "0.1"
+lz4_flex = "0.14"
+zlib-rs = "0.6"
+libdeflater = "1.24"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[workspace]

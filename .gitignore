@@ -1,0 +1,4 @@
+/target/
+/benchmarks/compare/target/
+/benchmarks/corpus/
+/benchmarks/results/*.tmp

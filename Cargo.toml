@@ -1,0 +1,28 @@
+[package]
+name = "yolowzstd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Pure-Rust, hardware-adaptive Zstandard (RFC 8878) codec — zero runtime dependencies, #![forbid(unsafe_code)]."
+license = "MIT"
+repository = "https://github.com/YOLOW92/yolowzstd"
+homepage = "https://github.com/YOLOW92/yolowzstd"
+documentation = "https://docs.rs/yolowzstd"
+readme = "README.md"
+keywords = ["zstd", "zstandard", "compression", "decompression", "pure-rust"]
+categories = ["compression", "encoding"]
+include = [
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "Cargo.toml",
+]
+
+[dependencies]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
