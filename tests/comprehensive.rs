@@ -332,3 +332,183 @@ fn bt_block_boundary_common_prefix_invariant() {
         assert_eq!(dec, data, "BST cross-block roundtrip failed at L{lvl}");
     }
 }
+
+#[test]
+fn fcs_window_descriptor_and_parallel_budget_regressions() {
+    // 1. Frame Content Size 一致性：Raw / RLE / Compressed(nseq=0 & nseq>0) 超出或不足均返回 Corrupt
+    let make_single_fcs_frame = |fcs: u8, hdr3: u32, payload: &[u8]| -> Vec<u8> {
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x20, fcs];
+        f.extend_from_slice(&hdr3.to_le_bytes()[..3]);
+        f.extend_from_slice(payload);
+        f
+    };
+    // Raw 20B when FCS=10 (also exceeds single-segment window_size=10)
+    let raw_over = make_single_fcs_frame(10, (20 << 3) | 1, &[b'a'; 20]);
+    assert!(matches!(decompress(&raw_over, 1024), Err(Error::Corrupt(_))));
+
+    // RLE 20B when FCS=10
+    let rle_over = make_single_fcs_frame(10, (20 << 3) | 3, b"a");
+    assert!(matches!(decompress(&rle_over, 1024), Err(Error::Corrupt(_))));
+
+    // Underflow: FCS=20 but RLE outputs 10B
+    let underflow = make_single_fcs_frame(20, (10 << 3) | 3, b"a");
+    assert!(matches!(decompress(&underflow, 1024), Err(Error::Corrupt(_))));
+
+    // Non-single-segment wlog=10 (Window_Size=1024), FCS=10, Raw block 20B -> Corrupt (not TooLarge!)
+    let mut non_single_over = vec![0x28, 0xB5, 0x2F, 0xFD, 0x40, 0x00]; // Wait: fcs=1 needs 2-byte (+256), use fcs=4 (0x80)
+    non_single_over.clear();
+    non_single_over.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD, 0x80, 0x00]); // single=0, wdesc=0(1024), fcs=4B
+    non_single_over.extend_from_slice(&10u32.to_le_bytes());
+    non_single_over.extend_from_slice(&((20u32 << 3) | 1).to_le_bytes()[..3]);
+    non_single_over.extend_from_slice(&[b'x'; 20]);
+    assert!(matches!(
+        decompress(&non_single_over, 1024),
+        Err(Error::Corrupt(_))
+    ));
+
+    // Compressed block nseq=0 outputting 12B when FCS=10 (non-single w=1024, fcs=10)
+    let mut c_nseq0 = vec![0x28, 0xB5, 0x2F, 0xFD, 0x80, 0x00];
+    c_nseq0.extend_from_slice(&10u32.to_le_bytes());
+    let lit_body: Vec<u8> = [vec![12u8 << 3], vec![b'b'; 12], vec![0u8]].concat();
+    c_nseq0.extend_from_slice(&(((lit_body.len() as u32) << 3) | 5).to_le_bytes()[..3]);
+    c_nseq0.extend_from_slice(&lit_body);
+    assert!(matches!(decompress(&c_nseq0, 1024), Err(Error::Corrupt(_))));
+
+    // Compressed block nseq=1 outputting 12B when FCS=10 (max_out=1024 -> must be Corrupt, not TooLarge)
+    // literals = "abcd" (4B), seq: ll=4, ml=8 (total 12B), off=1 (ofv=4 -> code 2, extra 0)
+    let c_valid_12 = compress(b"aaaaaaaaaaaa", 3); // might be RLE; craft 12B explicitly:
+    let _ = c_valid_12;
+    // Block with 4 raw lits "abcd" + 1 seq (ll=4, off=1 -> ofv=4, ml=8):
+    // nseq=1, modes=0x00 (predef), init states: ml_al=6 (sym=5 -> ml=8), of_al=5 (sym=2 -> ofv=4), ll_al=6 (sym=4 -> ll=4)
+    // Easier: compress 12 bytes "abcdabcdabcd" with zstd-like or simply check compressed frame with patched FCS!
+    let orig_200 = b"abcd".repeat(50);
+    let z200 = compress(&orig_200, 3);
+    // z200 is single-segment with fcs=1 (200) at byte 5. Patch FCS to 100 (byte 5 = 100) while max_out=1024 -> Corrupt!
+    if z200[4] == 0x24 || z200[4] == 0x20 {
+        let mut patched = z200.clone();
+        patched[5] = 100;
+        assert!(matches!(decompress(&patched, 1024), Err(Error::Corrupt(_))));
+    }
+
+    // 2. Window_Descriptor Block_Maximum_Size (1024) enforcement on Raw/RLE without FCS
+    let mut wd_raw_over = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+    wd_raw_over.extend_from_slice(&((1025u32 << 3) | 1).to_le_bytes()[..3]);
+    wd_raw_over.extend_from_slice(&[b'z'; 1025]);
+    assert!(matches!(decompress(&wd_raw_over, 8192), Err(Error::Corrupt(_))));
+
+    let mut wd_rle_over = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+    wd_rle_over.extend_from_slice(&((1025u32 << 3) | 3).to_le_bytes()[..3]);
+    wd_rle_over.push(b'z');
+    assert!(matches!(decompress(&wd_rle_over, 8192), Err(Error::Corrupt(_))));
+
+    // Compressed block size 1025: valid at wdesc=0x08 (Window_Size=2048), Corrupt at wdesc=0x00 (1024)
+    let make_comp_1025 = |wdesc: u8| -> Vec<u8> {
+        let mut body = vec![0x14, 0x40]; // Raw literals 1025B: ty=0, sf=1, n=1025
+        body.resize(2 + 1025, b'k');
+        body.push(0); // nseq = 0
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wdesc];
+        f.extend_from_slice(&(((body.len() as u32) << 3) | 5).to_le_bytes()[..3]);
+        f.extend_from_slice(&body);
+        f
+    };
+    assert_eq!(decompress(&make_comp_1025(0x08), 8192).unwrap().len(), 1025);
+    assert!(matches!(
+        decompress(&make_comp_1025(0x00), 8192),
+        Err(Error::Corrupt(_))
+    ));
+
+    // Match offset off=1025 after 1024+ output: valid at wdesc=0x08 (2048), Corrupt at wdesc=0x00 (1024)
+    let make_off_1025 = |wdesc: u8| -> Vec<u8> {
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wdesc];
+        f.extend_from_slice(&((1024u32 << 3) | 2).to_le_bytes()[..3]); // non-last RLE 1024B
+        f.push(b'a');
+        // Compressed block (last=1): 1 raw literal 'a', nseq=1, all RLE FSE (ll=1, off=1025 (code=10, extra=4), ml=3)
+        // Reverse bitstream (10b value 4 + 1 sentinel bit = 0x0404) -> [0x04, 0x04]
+        let cbody = [0x08u8, b'a', 1, 0x54, 1, 10, 0, 0x04, 0x04];
+        f.extend_from_slice(&(((cbody.len() as u32) << 3) | 5).to_le_bytes()[..3]);
+        f.extend_from_slice(&cbody);
+        f
+    };
+    assert_eq!(
+        decompress(&make_off_1025(0x08), 8192).unwrap(),
+        vec![b'a'; 1028]
+    );
+    assert!(matches!(
+        decompress(&make_off_1025(0x00), 8192),
+        Err(Error::Corrupt(_))
+    ));
+
+    // 3. Encoder window_log(Some(12)) on incompressible + compressible data -> zstd -d interop
+    let mut mixed_200k = lcg(140_000, 777);
+    mixed_200k.extend_from_slice(&structured_payload(60_000));
+    let z_w12 = compress_with(&mixed_200k, &CompressOptions::new(3).with_window_log(Some(12)));
+    assert_eq!(decompress(&z_w12, mixed_200k.len()).unwrap(), mixed_200k);
+    if Command::new("zstd").arg("--version").output().is_ok() {
+        let mut child = Command::new("zstd")
+            .args(["-d", "-c", "-q"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&z_w12).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "zstd -d rejected wlog=12 stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, mixed_200k);
+    }
+
+    // 4. Multi-frame without FCS falls back cleanly and obeys max_out
+    let chunk = structured_payload(150_000);
+    let mut no_fcs_frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x20]; // window_log=14 (16K), Wait: use 0x58 -> wlog=21 (2M)
+    no_fcs_frame[5] = 0x58;
+    let mut pos = 0;
+    while pos < chunk.len() {
+        let end = (pos + 65536).min(chunk.len());
+        let last = u32::from(end == chunk.len());
+        let blk = &chunk[pos..end];
+        no_fcs_frame.extend_from_slice(&(((blk.len() as u32) << 3) | last).to_le_bytes()[..3]);
+        no_fcs_frame.extend_from_slice(blk);
+        pos = end;
+    }
+    let mut four_unknown_frames = Vec::new();
+    for _ in 0..4 {
+        four_unknown_frames.extend_from_slice(&no_fcs_frame);
+    }
+    let dec_mt = decompress_with(
+        &four_unknown_frames,
+        &DecompressOptions::new().with_threads(4),
+        chunk.len() * 4,
+    )
+    .unwrap();
+    assert_eq!(dec_mt.len(), chunk.len() * 4);
+    let mut too_small_out = Vec::new();
+    let err = decompress_into_with(
+        &four_unknown_frames,
+        &mut too_small_out,
+        &DecompressOptions::new().with_threads(4),
+        chunk.len() * 2 + 1000,
+    )
+    .unwrap_err();
+    assert_eq!(err, Error::TooLarge);
+    assert_eq!(too_small_out.len(), chunk.len() * 2);
+
+    // 5. shrink_to_fit preserves reusable correctness
+    let mut comp = Compressor::new();
+    let mut dec = Decompressor::new();
+    let big = structured_payload(600_000);
+    let zb = comp.compress_with(&big, &CompressOptions::new(19).with_threads(2));
+    assert_eq!(
+        dec.decompress_with(&zb, &DecompressOptions::new().with_threads(2), big.len())
+            .unwrap(),
+        big
+    );
+    comp.shrink_to_fit();
+    dec.shrink_to_fit();
+    let small = b"small reusable payload after shrink";
+    let zs = comp.compress(small, 3);
+    assert_eq!(dec.decompress(&zs, small.len()).unwrap(), small);
+}

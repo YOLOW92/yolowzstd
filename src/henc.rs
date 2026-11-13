@@ -431,6 +431,7 @@ pub(crate) fn write_raw_or_rle_header(out: &mut Vec<u8>, ty: u8, n: usize) {
 }
 
 /// 将 `lits` 按最省空间的方式（RLE / 无头复用 Huffman / 新建 Huffman / Raw）直接写入 `out`。
+#[inline(never)]
 pub(crate) fn write_literals_into(
     lits: &[u8],
     out: &mut Vec<u8>,

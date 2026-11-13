@@ -1,7 +1,8 @@
-//! 哈希链匹配器与前向最优动态规划解析器：
+//! 哈希链/二叉树匹配器与前向启发式动态规划解析器：
 //! - level 5..=8：浅链 + 1 步前瞻
-//! - level 9..=15：深链 + 2 步前瞻
-//! - level 16..=22：深链 + 前向比特代价最优解析（Full Zstd 3-rep DP）
+//! - level 9..=11：深链 + 2 步前瞻
+//! - level 12..=15：二叉树后缀匹配器 + 前瞻
+//! - level 16..=22：二叉树后缀匹配器 + 块内近似比特代价前向启发式 DP（Zstd 3-rep）
 use crate::enc::Seq;
 use crate::lz::{MIN, Position, apply_rep, h_long, match_score, mlen, probe_reps, rd, rd4};
 use crate::resources::Budget;
@@ -85,6 +86,7 @@ pub(crate) struct Chain<P> {
     local_span: usize,
     next: usize,
     dp: Vec<DpNode>,
+    dp_idle: u8,
     back_ops: Vec<(u32, u32, u8)>, // (pos_or_lit_len, off, rep_code) 逆序复用缓冲
 }
 
@@ -105,6 +107,7 @@ impl<P: Position> Chain<P> {
             local_span: budget.local_span.max(1),
             next: 0,
             dp: Vec::new(),
+            dp_idle: 0,
             back_ops: Vec::new(),
         }
     }
@@ -126,6 +129,10 @@ impl<P: Position> Chain<P> {
         }
         if want_prev > self.prev.len() {
             self.prev.resize(want_prev, P::EMPTY);
+            need_zero = true;
+        } else if self.prev.len() > want_prev.saturating_mul(4).max(4 << 20) {
+            self.prev.truncate(want_prev);
+            self.prev.shrink_to_fit();
             need_zero = true;
         }
         let overflow = if P::WIDE {
@@ -199,6 +206,9 @@ impl<P: Position> Chain<P> {
                 }
             }
         }
+        if best.2 >= cfg.sufficient {
+            return (best.0, best.1, best.2);
+        }
         let mut raw = self.head[h4(v32, self.active_bits)].to_raw();
         let mut spent = 0usize;
         let max_len = (end - i).min(cfg.sufficient);
@@ -240,18 +250,28 @@ impl<P: Position> Chain<P> {
         lits: &mut Vec<u8>,
     ) -> usize {
         if cfg.optimal && range.1 - range.0 >= 64 {
+            self.dp_idle = 0;
             self.parse_opt(d, range, cfg, rep, seqs, lits)
-        } else if cfg.bt {
-            self.parse_bt_lazy(d, range, cfg, rep, seqs, lits)
         } else {
-            self.parse_lazy(d, range, cfg, rep, seqs, lits)
+            if self.dp.capacity() > 0 {
+                self.dp_idle = self.dp_idle.saturating_add(1);
+                if self.dp_idle >= 4 {
+                    self.dp = Vec::new();
+                    self.dp_idle = 0;
+                }
+            }
+            if cfg.bt {
+                self.parse_bt_lazy(d, range, cfg, rep, seqs, lits)
+            } else {
+                self.parse_lazy(d, range, cfg, rep, seqs, lits)
+            }
         }
     }
 
     /// 将位置 `p` 插入二叉搜索树并同步收集后缀匹配（`< p` 的严格左/右子树，无自环与越界风险）。
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn bt_step(
+    fn bt_step<const COLLECT: bool>(
         &mut self,
         d: &[u8],
         p: usize,
@@ -275,7 +295,7 @@ impl<P: Position> Chain<P> {
             let hl = h_long(rd(d, p), bits);
             let old_l = self.long[hl].to_raw();
             self.long[hl] = new_pv;
-            if old_l > base {
+            if COLLECT && old_l > base {
                 let c = old_l - base - 1;
                 if c < p && p - c <= win_limit && p - c < win_cap {
                     let ml = mlen(d, c, p, end);
@@ -321,7 +341,7 @@ impl<P: Position> Chain<P> {
             } else {
                 m_common + mlen(d, c + m_common, p + m_common, end)
             };
-            if ml >= MIN && ml > *max_ml && *nc < cands.len() {
+            if COLLECT && ml >= MIN && ml > *max_ml && *nc < cands.len() {
                 *max_ml = ml;
                 cands[*nc] = (ml, p - c, 0);
                 *nc += 1;
@@ -363,7 +383,7 @@ impl<P: Position> Chain<P> {
         let mut cands = [(0usize, 0usize, 0u8); 16];
         let mut nc = 0usize;
         let mut max_ml = 0usize;
-        self.bt_step(
+        self.bt_step::<true>(
             d,
             p,
             end,
@@ -437,7 +457,7 @@ impl<P: Position> Chain<P> {
             while p + MIN <= end && p < stop {
                 let mut nc = 0;
                 let mut ml = 0;
-                self.bt_step(
+                self.bt_step::<false>(
                     d,
                     p,
                     end,
@@ -521,7 +541,7 @@ impl<P: Position> Chain<P> {
         anchor
     }
 
-    /// 块内前向比特代价最优解析（完整追踪三重复偏移，匹配段超过 `sufficient` 时直接跨跳）。
+    /// 块内前向启发式比特代价 DP 解析（近似估算字面量与序列比特代价并追踪 3 个重复偏移，匹配段超过 `sufficient` 时直接跨跳）。
     #[inline(never)]
     fn parse_opt(
         &mut self,
@@ -641,7 +661,7 @@ impl<P: Position> Chain<P> {
                 }
             }
             if pos >= self.next {
-                self.bt_step(
+                self.bt_step::<true>(
                     d,
                     pos,
                     end,
@@ -684,7 +704,7 @@ impl<P: Position> Chain<P> {
                 while p + MIN <= end && p < stop_pos {
                     let mut dn = 0;
                     let mut dm = 0;
-                    self.bt_step(
+                    self.bt_step::<false>(
                         d,
                         p,
                         end,

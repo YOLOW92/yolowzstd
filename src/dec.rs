@@ -265,6 +265,7 @@ pub struct Decompressor {
     state: Box<State>,
     mt_states: Vec<Box<State>>,
     mt_slots: Vec<Vec<u8>>,
+    mt_idle: u8,
 }
 
 impl Default for Decompressor {
@@ -280,6 +281,32 @@ impl Decompressor {
             state: Box::new(State::new()),
             mt_states: Vec::new(),
             mt_slots: Vec::new(),
+            mt_idle: 0,
+        }
+    }
+
+    /// 释放并行工作上下文与临时输出槽位，保留当前解压器可继续复用。
+    pub fn shrink_to_fit(&mut self) {
+        self.state.lits.clear();
+        self.state.lits.shrink_to_fit();
+        self.mt_states.clear();
+        self.mt_states.shrink_to_fit();
+        self.mt_slots.clear();
+        self.mt_slots.shrink_to_fit();
+        self.mt_idle = 0;
+    }
+
+    #[inline]
+    fn tick_mt_idle(&mut self) {
+        if !self.mt_states.is_empty() || !self.mt_slots.is_empty() {
+            self.mt_idle = self.mt_idle.saturating_add(1);
+            if self.mt_idle >= 8 {
+                self.mt_states.clear();
+                self.mt_states.shrink_to_fit();
+                self.mt_slots.clear();
+                self.mt_slots.shrink_to_fit();
+                self.mt_idle = 0;
+            }
         }
     }
 
@@ -309,6 +336,7 @@ impl Decompressor {
         out: &mut Vec<u8>,
         max_out: usize,
     ) -> Result<()> {
+        self.tick_mt_idle();
         decompress_with_state(&mut self.state, data, out, max_out)
     }
 
@@ -321,12 +349,14 @@ impl Decompressor {
         max_out: usize,
     ) -> Result<()> {
         if opts.threads == 1 || data.len() < MAX_BLOCK {
+            self.tick_mt_idle();
             decompress_with_state(&mut self.state, data, out, max_out)
         } else {
             crate::mt::decompress_parallel(
                 &mut self.state,
                 &mut self.mt_states,
                 &mut self.mt_slots,
+                &mut self.mt_idle,
                 data,
                 out,
                 opts,
@@ -416,9 +446,17 @@ pub(crate) struct FrameHeader {
     pub header_len: usize,
     pub checksum: bool,
     pub uncomp_len: Option<u64>,
+    pub window_size: usize,
 }
 
-/// 解析 Zstd 帧头（不含魔数），返回帧头长度、校验位与可选原始内容长度。
+impl FrameHeader {
+    #[inline]
+    pub(crate) fn block_max(&self) -> usize {
+        self.window_size.min(MAX_BLOCK)
+    }
+}
+
+/// 解析 Zstd 帧头（不含魔数），返回帧头长度、校验位、可选原始内容长度与窗口上限。
 pub(crate) fn parse_frame_header(d: &[u8]) -> Result<FrameHeader> {
     let fd = *d.first().ok_or(Error::Corrupt("truncated frame header"))?;
     let single = fd & 0x20 != 0;
@@ -452,11 +490,22 @@ pub(crate) fn parse_frame_header(d: &[u8]) -> Result<FrameHeader> {
     } else {
         None
     };
+    let window_size = if single {
+        usize::try_from(uncomp_len.unwrap_or(0)).unwrap_or(usize::MAX)
+    } else {
+        let wd = d[1];
+        let exp = (wd >> 3) as u32;
+        let mant = (wd & 7) as u64;
+        let base = 1u64 << (10 + exp);
+        let w = base + (base >> 3) * mant;
+        usize::try_from(w).unwrap_or(usize::MAX)
+    };
     p += did + fcs;
     Ok(FrameHeader {
         header_len: p,
         checksum,
         uncomp_len,
+        window_size,
     })
 }
 
@@ -464,6 +513,8 @@ pub(crate) fn parse_frame_header(d: &[u8]) -> Result<FrameHeader> {
 fn frame(d: &[u8], st: &mut State, out: &mut Vec<u8>, max_out: usize) -> Result<usize> {
     let fh = parse_frame_header(d)?;
     let checksum = fh.checksum;
+    let block_max = fh.block_max();
+    let win_limit = fh.window_size;
     let mut frame_end = None;
     if let Some(v) = fh.uncomp_len {
         let avail = max_out.saturating_sub(out.len());
@@ -488,20 +539,30 @@ fn frame(d: &[u8], st: &mut State, out: &mut Vec<u8>, max_out: usize) -> Result<
         let size = v >> 3;
         match (v >> 1) & 3 {
             0 => {
-                if size > MAX_BLOCK {
+                if size > block_max {
                     return Err(Error::Corrupt("raw block too large"));
                 }
                 let b = d
                     .get(p..p + size)
                     .ok_or(Error::Corrupt("truncated raw block"))?;
+                if let Some(fe) = frame_end
+                    && out.len() + size > fe
+                {
+                    return Err(Error::Corrupt("frame content size mismatch"));
+                }
                 push(out, b, max_out)?;
                 p += size;
             }
             1 => {
-                if size > MAX_BLOCK {
+                if size > block_max {
                     return Err(Error::Corrupt("rle block too large"));
                 }
                 let b = *d.get(p).ok_or(Error::Corrupt("truncated rle block"))?;
+                if let Some(fe) = frame_end
+                    && out.len() + size > fe
+                {
+                    return Err(Error::Corrupt("frame content size mismatch"));
+                }
                 if out.len() + size > max_out {
                     return Err(Error::TooLarge);
                 }
@@ -509,14 +570,14 @@ fn frame(d: &[u8], st: &mut State, out: &mut Vec<u8>, max_out: usize) -> Result<
                 p += 1;
             }
             2 => {
-                if size > MAX_BLOCK {
+                if size > block_max {
                     return Err(Error::Corrupt("block too large"));
                 }
                 let b = d
                     .get(p..p + size)
                     .ok_or(Error::Corrupt("truncated block"))?;
                 let frame_rem = frame_end.map(|fe| fe.saturating_sub(out.len()));
-                block(b, st, out, start, max_out, frame_rem)?;
+                block(b, st, out, start, max_out, frame_rem, block_max, win_limit)?;
                 p += size;
             }
             _ => return Err(Error::Corrupt("reserved block type")),
@@ -524,6 +585,11 @@ fn frame(d: &[u8], st: &mut State, out: &mut Vec<u8>, max_out: usize) -> Result<
         if last {
             break;
         }
+    }
+    if let Some(fe) = frame_end
+        && out.len() != fe
+    {
+        return Err(Error::Corrupt("frame content size mismatch"));
     }
     if checksum {
         let c = d
@@ -692,21 +758,21 @@ fn prepare_seq_table(
 #[cold]
 #[inline(never)]
 fn copy_long_lits(dst: &mut [u8], pos: usize, lits: &[u8], lp: usize, llen: usize) {
-    let mut d = 0usize;
-    while d < llen {
-        dst[pos + d..pos + d + 16].copy_from_slice(&lits[lp + d..lp + d + 16]);
-        d += 16;
-    }
+    dst[pos..pos + llen].copy_from_slice(&lits[lp..lp + llen]);
 }
 
 #[cold]
 #[inline(never)]
-fn copy_long_match(dst: &mut [u8], p: usize, from: usize, mlen: usize) {
-    let mut d = 16usize;
-    while d < mlen {
-        let (h, t) = dst.split_at_mut(p + d);
-        t[..16].copy_from_slice(&h[from + d..from + d + 16]);
-        d += 16;
+fn copy_long_match(dst: &mut [u8], p: usize, from: usize, off: usize, mlen: usize) {
+    if off >= mlen {
+        dst.copy_within(from + 16..from + mlen, p + 16);
+    } else {
+        let mut d = 16usize;
+        while d < mlen {
+            let (h, t) = dst.split_at_mut(p + d);
+            t[..16].copy_from_slice(&h[from + d..from + d + 16]);
+            d += 16;
+        }
     }
 }
 
@@ -754,52 +820,59 @@ fn copy_short_off(dst: &mut [u8], p: usize, from: usize, off: usize, mlen: usize
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn apply_seq_slice(
-    llen: usize,
-    mlen: usize,
+    llen: u32,
+    mlen: u32,
     off: usize,
     lits: &[u8],
     lit_len: usize,
     lp: &mut usize,
     dst: &mut [u8],
+    end_cap: usize,
     pos: &mut usize,
     start: usize,
-    block_end_cap: usize,
+    win_limit: usize,
     max_block_end: usize,
 ) -> Result<()> {
-    let new_lp = *lp + llen;
-    if new_lp > lit_len {
+    let ll = llen as usize;
+    let ml = mlen as usize;
+    let cur_lp = *lp;
+    let cur_pos = *pos;
+    if cur_lp > lit_len || ll > lit_len - cur_lp {
         return Err(Error::Corrupt("literal run overrun"));
     }
-    let next_pos = *pos + llen + mlen;
-    if next_pos > block_end_cap {
+    let step = ll + ml;
+    if cur_pos > end_cap || step > end_cap - cur_pos {
+        let next_pos = cur_pos.saturating_add(step);
         if next_pos > max_block_end {
             return Err(Error::Corrupt("regenerated block too large"));
         }
         return Err(Error::TooLarge);
     }
-    if llen <= 16 {
-        dst[*pos..*pos + 16].copy_from_slice(&lits[*lp..*lp + 16]);
+    let next_pos = cur_pos + step;
+    if ll <= 16 {
+        dst[cur_pos..cur_pos + 16].copy_from_slice(&lits[cur_lp..cur_lp + 16]);
     } else {
-        copy_long_lits(dst, *pos, lits, *lp, llen);
+        copy_long_lits(dst, cur_pos, lits, cur_lp, ll);
     }
-    *lp = new_lp;
-    let p = *pos + llen;
-    if off == 0 || off > p - start {
+    *lp = cur_lp + ll;
+    let p = cur_pos + ll;
+    let max_off = (p - start).min(win_limit);
+    if off == 0 || off > max_off {
         return Err(Error::Corrupt("offset beyond history"));
     }
     let from = p - off;
     if off >= 16 {
         let (head, tail) = dst.split_at_mut(p);
         tail[..16].copy_from_slice(&head[from..from + 16]);
-        if mlen > 16 {
-            if off >= 32 && mlen <= 32 {
+        if ml > 16 {
+            if off >= 32 && ml <= 32 {
                 tail[16..32].copy_from_slice(&head[from + 16..from + 32]);
             } else {
-                copy_long_match(dst, p, from, mlen);
+                copy_long_match(dst, p, from, off, ml);
             }
         }
     } else {
-        copy_short_off(dst, p, from, off, mlen);
+        copy_short_off(dst, p, from, off, ml);
     }
     *pos = next_pos;
     Ok(())
@@ -918,6 +991,66 @@ struct SeqLoopState {
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
+fn decode_seq_batch(
+    cur: &mut RevCursor,
+    seq_data: &[u8],
+    ll: &[SCell; 512],
+    of: &[SCell; 256],
+    ml: &[SCell; 512],
+    sl: &mut usize,
+    so: &mut usize,
+    sm: &mut usize,
+    batch: &mut [(u32, u32, u32); 32],
+    max_cnt: usize,
+) -> (usize, bool) {
+    let mut cnt = 0usize;
+    let mut c = *cur;
+    let mut l = *sl;
+    let mut o = *so;
+    let mut m = *sm;
+    let mut long_hit = false;
+    while cnt < max_cnt && c.cur >= 8 && c.cur <= seq_data.len() {
+        let cl = ll[l & 511];
+        let co = of[o & 255];
+        let cm = ml[m & 511];
+        let (eo, em, el) = (co.eb as u32, cm.eb as u32, cl.eb as u32);
+        let (nl, nm, no) = (cl.nb as u32, cm.nb as u32, co.nb as u32);
+        let no_nm = no + nm;
+        let tn = no_nm + nl;
+        let el_em = el + em;
+        let total_bits = eo + el_em + tn;
+        if total_bits > 56 {
+            long_hit = true;
+            break;
+        }
+        let raw = c.load_msb(seq_data);
+        let v = (raw >> 8) >> (56 - total_bits);
+        c.advance(total_bits);
+
+        let ev = v >> tn;
+        let uo = v & mask64(no);
+        let um = (v >> no) & mask64(nm);
+        let ul = (v >> no_nm) & mask64(nl);
+        let xl = ev & mask64(el);
+        let xm = (ev >> el) & mask64(em);
+        let xo = ev >> el_em;
+
+        l = cl.base as usize + ul as usize;
+        m = cm.base as usize + um as usize;
+        o = co.base as usize + uo as usize;
+
+        batch[cnt] = (cl.val + xl as u32, cm.val + xm as u32, co.val + xo as u32);
+        cnt += 1;
+    }
+    *cur = c;
+    *sl = l;
+    *so = o;
+    *sm = m;
+    (cnt, long_hit)
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn run_seq_loop(
     s: &mut SeqLoopState,
     nseq: usize,
@@ -926,12 +1059,17 @@ fn run_seq_loop(
     of: &[SCell; 256],
     ml: &[SCell; 512],
     lits: &[u8],
-    lit_len: usize,
     dst: &mut [u8],
     start: usize,
-    end_cap: usize,
+    win_limit: usize,
     max_block_end: usize,
 ) -> Result<()> {
+    let Some(end_cap) = dst.len().checked_sub(32) else {
+        return Ok(());
+    };
+    let Some(lit_len) = lits.len().checked_sub(16) else {
+        return Ok(());
+    };
     let mut seq_idx = s.seq_idx;
     let mut sl = s.sl;
     let mut so = s.so;
@@ -945,53 +1083,42 @@ fn run_seq_loop(
     };
 
     let limit = nseq.saturating_sub(1);
+    let mut batch = [(0u32, 0u32, 0u32); 32];
     while seq_idx < limit && cur.cur >= 8 && cur.cur <= seq_data.len() {
-        let cl = ll[sl & 511];
-        let co = of[so & 255];
-        let cm = ml[sm & 511];
-        let (eo, em, el) = (co.eb as u32, cm.eb as u32, cl.eb as u32);
-        let (nl, nm, no) = (cl.nb as u32, cm.nb as u32, co.nb as u32);
-        let no_nm = no + nm;
-        let tn = no_nm + nl;
-        let el_em = el + em;
-        let total_bits = eo + el_em + tn;
-        if total_bits > 56 {
+        let max_cnt = (limit - seq_idx).min(32);
+        let (cnt, long_hit) = decode_seq_batch(
+            &mut cur,
+            seq_data,
+            ll,
+            of,
+            ml,
+            &mut sl,
+            &mut so,
+            &mut sm,
+            &mut batch,
+            max_cnt,
+        );
+        for &(llen, mlen, ofv) in &batch[..cnt] {
+            let off = update_hist(ofv, llen, &mut hist);
+            apply_seq_slice(
+                llen,
+                mlen,
+                off,
+                lits,
+                lit_len,
+                &mut lp,
+                dst,
+                end_cap,
+                &mut pos,
+                start,
+                win_limit,
+                max_block_end,
+            )?;
+        }
+        seq_idx += cnt;
+        if long_hit {
             break;
         }
-        let raw = cur.load_msb(seq_data);
-        let v = (raw >> 8) >> (56 - total_bits);
-        cur.advance(total_bits);
-
-        let ev = v >> tn;
-        let uo = v & mask64(no);
-        let um = (v >> no) & mask64(nm);
-        let ul = (v >> no_nm) & mask64(nl);
-        let xl = ev & mask64(el);
-        let xm = (ev >> el) & mask64(em);
-        let xo = ev >> el_em;
-
-        sl = cl.base as usize + ul as usize;
-        sm = cm.base as usize + um as usize;
-        so = co.base as usize + uo as usize;
-
-        let ofv = co.val + xo as u32;
-        let mlen = cm.val + xm as u32;
-        let llen = cl.val + xl as u32;
-        let off = update_hist(ofv, llen, &mut hist);
-        apply_seq_slice(
-            llen as usize,
-            mlen as usize,
-            off,
-            lits,
-            lit_len,
-            &mut lp,
-            dst,
-            &mut pos,
-            start,
-            end_cap,
-            max_block_end,
-        )?;
-        seq_idx += 1;
     }
 
     s.seq_idx = seq_idx;
@@ -1005,6 +1132,7 @@ fn run_seq_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn block(
     b: &[u8],
     st: &mut State,
@@ -1012,11 +1140,16 @@ fn block(
     start: usize,
     max_out: usize,
     frame_rem: Option<usize>,
+    block_max: usize,
+    win_limit: usize,
 ) -> Result<()> {
     if b.is_empty() {
         return Err(Error::Corrupt("empty block"));
     }
     let (lit_raw, lit_len, mut p) = literals(b, &mut st.huff, &mut st.huff_valid, &mut st.lits)?;
+    if lit_len > block_max {
+        return Err(Error::Corrupt("literals too large"));
+    }
     let n0 = *b.get(p).ok_or(Error::Corrupt("missing sequences header"))? as usize;
     p += 1;
     let nseq = if n0 == 0 {
@@ -1033,10 +1166,13 @@ fn block(
         x[0] as usize + ((x[1] as usize) << 8) + 0x7F00
     };
     if nseq == 0 {
+        if frame_rem.is_some_and(|rem| lit_len > rem) {
+            return Err(Error::Corrupt("frame content size mismatch"));
+        }
         let lits = lit_raw.unwrap_or(&st.lits);
         return push(out, &lits[..lit_len], max_out);
     }
-    if nseq > MAX_BLOCK / 3 {
+    if nseq > block_max / 3 {
         return Err(Error::Corrupt("too many sequences"));
     }
     let modes = *b.get(p).ok_or(Error::Corrupt("missing modes"))?;
@@ -1095,13 +1231,12 @@ fn block(
     let seq_data = b.get(p..).unwrap_or(&[]);
     let block_base = out.len();
     let max_by_out = max_out.saturating_sub(block_base);
-    let max_block_end = block_base + MAX_BLOCK;
-    let block_end_cap = block_base + max_by_out.min(MAX_BLOCK);
-    let budget = frame_rem
-        .map(|rem| rem.min(max_by_out).min(MAX_BLOCK))
-        .unwrap_or_else(|| max_by_out.min(MAX_BLOCK));
-    let safe_end = block_base + budget;
-    out.resize(safe_end + 32, 0);
+    let max_block_end = block_base + frame_rem.map_or(block_max, |rem| rem.min(block_max));
+    let block_end_cap = block_base
+        + frame_rem
+            .map_or(max_by_out, |rem| rem.min(max_by_out))
+            .min(block_max);
+    out.resize(block_end_cap + 32, 0);
 
     let mut cur = RevCursor::new(seq_data)?;
     let (mut sl, mut so, mut sm);
@@ -1125,8 +1260,7 @@ fn block(
         so = (v1 & mask64(st.of_al)) as usize;
         sl = ((v1 >> st.of_al) & mask64(st.ll_al)) as usize;
 
-        let dst = out.as_mut_slice();
-        let end_cap = block_end_cap.min(safe_end);
+        let dst = &mut out[..block_end_cap + 32];
         let mut s = SeqLoopState {
             seq_idx,
             sl,
@@ -1147,10 +1281,9 @@ fn block(
                 of,
                 ml,
                 lits,
-                lit_len,
                 dst,
                 start,
-                end_cap,
+                win_limit,
                 max_block_end,
             ) {
                 out.truncate(block_base);
@@ -1174,16 +1307,17 @@ fn block(
             let llen = cl.val + xl as u32;
             let off = update_hist(ofv, llen, &mut s.hist);
             if let Err(e) = apply_seq_slice(
-                llen as usize,
-                mlen as usize,
+                llen,
+                mlen,
                 off,
                 lits,
                 lit_len,
                 &mut s.lp,
                 dst,
+                block_end_cap,
                 &mut s.pos,
                 start,
-                end_cap,
+                win_limit,
                 max_block_end,
             ) {
                 out.truncate(block_base);
@@ -1228,7 +1362,8 @@ fn block(
         out.as_mut_slice(),
         pos,
         start,
-        block_end_cap.min(safe_end),
+        win_limit,
+        block_end_cap,
         max_block_end,
         hist,
         &mut st.hist,
@@ -1262,6 +1397,7 @@ fn finish_slow_seqs(
     dst: &mut [u8],
     mut pos: usize,
     start: usize,
+    win_limit: usize,
     block_end_cap: usize,
     max_block_end: usize,
     mut hist: [usize; 3],
@@ -1305,16 +1441,17 @@ fn finish_slow_seqs(
         let llen = cl.val + xl as u32;
         let off = update_hist(ofv, llen, &mut hist);
         apply_seq_slice(
-            llen as usize,
-            mlen as usize,
+            llen,
+            mlen,
             off,
             lits,
             lit_len,
             &mut lp,
             dst,
+            block_end_cap,
             &mut pos,
             start,
-            block_end_cap,
+            win_limit,
             max_block_end,
         )?;
         seq_idx += 1;

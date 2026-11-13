@@ -79,8 +79,8 @@ pub(crate) fn rd4(d: &[u8], p: usize) -> u32 {
     u32::from_le_bytes(d[p..p + 4].try_into().expect("4 字节"))
 }
 
-#[inline(always)]
-pub(crate) fn mlen(d: &[u8], a: usize, b: usize, end: usize) -> usize {
+#[inline(never)]
+fn mlen_tail(d: &[u8], a: usize, b: usize, end: usize) -> usize {
     if a >= b || end > d.len() {
         return 0;
     }
@@ -89,10 +89,30 @@ pub(crate) fn mlen(d: &[u8], a: usize, b: usize, end: usize) -> usize {
     while b + l + 8 <= end {
         let x = rd(d, a + l) ^ rd(d, b + l);
         if x != 0 {
-            return l + (x.trailing_zeros() / 8) as usize;
+            return l + (x.trailing_zeros() >> 3) as usize;
         }
         l += 8;
     }
+    while b + l < end && d[a + l] == d[b + l] {
+        l += 1;
+    }
+    l
+}
+
+#[inline(always)]
+pub(crate) fn mlen(d: &[u8], a: usize, b: usize, end: usize) -> usize {
+    if a >= b || end > d.len() {
+        return 0;
+    }
+    if b + 8 <= end {
+        let x = rd(d, a) ^ rd(d, b);
+        if x != 0 {
+            return (x.trailing_zeros() >> 3) as usize;
+        }
+        return 8 + mlen_tail(d, a + 8, b + 8, end);
+    }
+    let d = &d[..end];
+    let mut l = 0;
     while b + l < end && d[a + l] == d[b + l] {
         l += 1;
     }

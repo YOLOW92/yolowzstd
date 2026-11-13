@@ -67,18 +67,18 @@ fn main() -> Result<(), yolowzstd::Error> {
 
 ## Architecture & Capabilities
 
-- **RFC 8878 Decoder**:
-  - Multi-frame & skippable-frame streams, Raw / RLE / Compressed blocks
+- **RFC 8878 Decoder (no dictionary support)**:
+  - Multi-frame & skippable-frame streams, Raw / RLE / Compressed blocks (returns `Error::Unsupported` on frames requiring a dictionary)
   - Predefined, RLE, Custom, and Repeat FSE sequence tables
   - 1-stream & 4-stream Huffman literals with Huffman tree reuse across blocks
   - 3-slot repeat offset state machine, single-pass sequence execution with cold-path outlining
-  - XXH64 frame content checksum verification and strict untrusted-input bounds (`max_out`, no panics)
+  - XXH64 frame content checksum verification and strict logical output-size bounds (`max_out`, no panics; caps decompressed output bytes rather than hard process RSS)
 - **Adaptive Multi-Tier Encoder (`level <= 0` through `22`)**:
   - `level <= 0`: Raw / RLE fast path
   - `1..=4`: Generation-stamped L2-sized Fast / DoubleFast hash tables with repeat-offset probing and incompressible Huffman skip at L1
   - `5..=15`: Hash chains + 1/2-step lazy matching (`12..=15` binary-tree suffix matcher)
-  - `16..=22`: Binary-tree suffix matcher + forward bit-cost DP optimal parser
-  - Multi-core engine (`src/mt.rs`): aligns chunks to 128 KiB blocks, emits standard concatenated frames (100% interoperable with every RFC 8878 decoder), and decodes multi-frame streams in parallel via lock-free atomic work stealing.
+  - `16..=22`: Binary-tree suffix matcher + heuristic forward bit-cost DP block parser (not globally exact optimal)
+  - Multi-core engine (`src/mt.rs`): aligns chunks to 128 KiB blocks, emits standard concatenated frames (100% interoperable with every RFC 8878 decoder), and decodes multi-frame streams with `>= 2` frames having known `Frame_Content_Size` in parallel via atomic work claiming and per-slot `Mutex` output buffers (falling back to single-thread otherwise).
 
 ---
 
@@ -97,7 +97,7 @@ Higher is better for speed (`MB/s ↑`) and ratio (`↑`).
 | **L9** | **126.4 MB/s** | 103.0 / **130.0 MB/s** | 3.34x | 81.9 / 80.3 MB/s | **3.58x** | **2,981.9 / 3,025.3 MB/s** | 1,167.1 MB/s |
 | **L19** | **32.3 MB/s** | 25.3 / **32.6 MB/s** | 3.46x | 3.3 / 3.3 MB/s | **4.01x** | **3,282.7 / 3,360.9 MB/s** | 1,217.7 MB/s |
 
-> `c_libzstd` uses single-frame / streaming `ZSTD_decompress` (1 thread) because RFC 8878 single frames have sequential LZ77 dependencies; `yolowzstd` parallel encoding outputs concatenated frames, unlocking multi-core decoding for both `yolowzstd` and multi-frame callers.
+> `c_libzstd` uses single-frame / streaming `ZSTD_decompress` (1 thread) because RFC 8878 single frames have sequential LZ77 dependencies; `yolowzstd` parallel encoding emits standard concatenated frames, allowing parallel decoding when an input has `>= 2` independent frames that all declare `Frame_Content_Size` (otherwise falling back to single-thread).
 
 ### 2. Short Payloads (`dickens` prefixes, single-core pinned `taskset -c 4`, `MB/s ↑`)
 
@@ -128,7 +128,8 @@ Higher is better for speed (`MB/s ↑`) and ratio (`↑`).
 ### Honest Tradeoffs
 
 - `yolowzstd` forbids `unsafe` (`#![forbid(unsafe_code)]`), so on single-core long-stream decode C `libzstd` and `unsafe`-heavy / C-translated Rust crates (`rust-zstd`, `zstd-pure-rs`) remain faster per core (`1,019–1,315 MB/s` vs `806.5 MB/s` at L3); `yolowzstd` leads all `#![forbid(unsafe_code)]` stream decoders (`zstd-rs`, `oxiarc-zstd`, `ruzstd`), leads 64 B encode/decode across every implementation tested, and beats `libzstd` across multi-core L3/L9/L19 encoding and multi-frame decoding.
-- Single-core L9/L19 and multi-core L19 trade lower compression ratio (`3.46x` vs `4.01x` at L19) for bounded window/search depth and nearly 10× higher multi-core L19 speed (`32.6` vs `3.3 MB/s`).
+- Dictionary-compressed frames (`Dictionary_ID != 0`) are not supported yet and return `Error::Unsupported`. `max_out` enforces the logical decoded output byte ceiling (and combined multi-frame budgets), rather than capping process-wide physical RSS.
+- Single-core L9/L19 and multi-core L19 use a heuristic forward bit-cost DP parser (`16..=22`) and bounded window/search depth (`3.46x` vs `4.01x` at L19) in exchange for nearly 10× higher multi-core L19 throughput (`32.6` vs `3.3 MB/s`).
 
 ---
 

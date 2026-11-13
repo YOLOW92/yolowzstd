@@ -1,4 +1,4 @@
-//! 纯 Rust 的 zstd（RFC 8878）：完整解码器加基础编码器。无依赖、无 unsafe。
+//! 纯 Rust 的 zstd（RFC 8878，不支持字典）：独立分帧多核编解码与上下文复用。无依赖、`#![forbid(unsafe_code)]`。
 //!
 //! - [`decompress`]：输入不可信，输出有上限，坏输入返回 [`Error`]，不会 panic。
 //!   支持多帧、跳过帧、Raw/RLE/压缩块、FSE 与 Huffman（含 4 流及树复用）、重复偏移。

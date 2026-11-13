@@ -7,10 +7,42 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::dec::{DecompressOptions, MAX_BLOCK, State, decompress_with_state, parse_frame_header};
+use crate::dec::{DecompressOptions, State, decompress_with_state, parse_frame_header};
 use crate::enc::{BLOCK, CompressOptions, EncCore};
 use crate::resources::{resolve_dec_threads, resolve_enc_threads};
 use crate::{Error, Result};
+
+const MAX_RETAINED_SLOTS: usize = 32;
+const MAX_RETAINED_SLOT_CAP: usize = 4 << 20;
+const MAX_RETAINED_SLOTS_BYTES: usize = 32 << 20;
+
+#[inline]
+fn retain_slots(mt_slots: &mut Vec<Vec<u8>>, buf: Vec<u8>, retained_bytes: &mut usize) {
+    let cap = buf.capacity();
+    if mt_slots.len() < MAX_RETAINED_SLOTS
+        && cap <= MAX_RETAINED_SLOT_CAP
+        && retained_bytes.saturating_add(cap) <= MAX_RETAINED_SLOTS_BYTES
+    {
+        *retained_bytes += cap;
+        let mut b = buf;
+        b.clear();
+        mt_slots.push(b);
+    }
+}
+
+#[inline]
+fn tick_idle_vec<T>(workers: &mut Vec<T>, slots: &mut Vec<Vec<u8>>, mt_idle: &mut u8) {
+    if !workers.is_empty() || !slots.is_empty() {
+        *mt_idle = mt_idle.saturating_add(1);
+        if *mt_idle >= 8 {
+            workers.clear();
+            workers.shrink_to_fit();
+            slots.clear();
+            slots.shrink_to_fit();
+            *mt_idle = 0;
+        }
+    }
+}
 
 struct FrameSpan {
     start: usize,
@@ -58,21 +90,25 @@ pub(crate) fn compress_parallel(
     core: &mut EncCore,
     mt_workers: &mut Vec<EncCore>,
     mt_slots: &mut Vec<Vec<u8>>,
+    mt_idle: &mut u8,
     data: &[u8],
     out: &mut Vec<u8>,
     opts: &CompressOptions,
 ) {
     let workers = resolve_enc_threads(opts.threads, opts.level);
     let Some(ranges) = enc_chunk_ranges(data.len(), opts.level, workers) else {
+        tick_idle_vec(mt_workers, mt_slots, mt_idle);
         core.compress_single_frame(data, out, opts);
         return;
     };
     let nchunks = ranges.len();
     let active = workers.min(nchunks);
     if active <= 1 {
+        tick_idle_vec(mt_workers, mt_slots, mt_idle);
         core.compress_single_frame(data, out, opts);
         return;
     }
+    *mt_idle = 0;
 
     if mt_workers.len() < active - 1 {
         mt_workers.resize_with(active - 1, EncCore::new);
@@ -122,11 +158,11 @@ pub(crate) fn compress_parallel(
         .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).len())
         .sum();
     out.reserve(total_comp);
+    let mut retained_bytes: usize = mt_slots.iter().map(Vec::capacity).sum();
     for slot in slots {
-        let mut buf = slot.into_inner().unwrap_or_else(|e| e.into_inner());
+        let buf = slot.into_inner().unwrap_or_else(|e| e.into_inner());
         out.extend_from_slice(&buf);
-        buf.clear();
-        mt_slots.push(buf);
+        retain_slots(mt_slots, buf, &mut retained_bytes);
     }
 }
 
@@ -160,6 +196,7 @@ fn scan_frames(data: &[u8]) -> Result<Vec<FrameSpan>> {
         }
         let d = &data[pos..];
         let fh = parse_frame_header(d)?;
+        let block_max = fh.block_max();
         let mut p = fh.header_len;
         loop {
             let h = d
@@ -171,7 +208,7 @@ fn scan_frames(data: &[u8]) -> Result<Vec<FrameSpan>> {
             let size = v >> 3;
             match (v >> 1) & 3 {
                 0 | 2 => {
-                    if size > MAX_BLOCK {
+                    if size > block_max {
                         return Err(Error::Corrupt("block too large"));
                     }
                     p = p
@@ -180,7 +217,7 @@ fn scan_frames(data: &[u8]) -> Result<Vec<FrameSpan>> {
                         .ok_or(Error::Corrupt("truncated block"))?;
                 }
                 1 => {
-                    if size > MAX_BLOCK {
+                    if size > block_max {
                         return Err(Error::Corrupt("rle block too large"));
                     }
                     p = p
@@ -210,10 +247,12 @@ fn scan_frames(data: &[u8]) -> Result<Vec<FrameSpan>> {
     Ok(spans)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decompress_parallel(
     state: &mut State,
     mt_states: &mut Vec<Box<State>>,
     mt_slots: &mut Vec<Vec<u8>>,
+    mt_idle: &mut u8,
     data: &[u8],
     out: &mut Vec<u8>,
     opts: &DecompressOptions,
@@ -221,13 +260,16 @@ pub(crate) fn decompress_parallel(
 ) -> Result<()> {
     let workers = resolve_dec_threads(opts.threads);
     if workers <= 1 {
+        tick_idle_vec(mt_states, mt_slots, mt_idle);
         return decompress_with_state(state, data, out, max_out);
     }
     let Ok(spans) = scan_frames(data) else {
         // 出错回退给单线程以保持前缀已解码块及精确错误码。
+        tick_idle_vec(mt_states, mt_slots, mt_idle);
         return decompress_with_state(state, data, out, max_out);
     };
     if spans.len() < 2 {
+        tick_idle_vec(mt_states, mt_slots, mt_idle);
         return decompress_with_state(state, data, out, max_out);
     }
 
@@ -238,12 +280,17 @@ pub(crate) fn decompress_parallel(
             _ => None,
         };
     }
-    if let Some(total) = known_total {
-        let avail = max_out.saturating_sub(out.len());
-        if total > avail || total < 256 * 1024 {
-            return decompress_with_state(state, data, out, max_out);
-        }
+    let avail = max_out.saturating_sub(out.len());
+    let Some(total) = known_total else {
+        // 含未声明 Frame_Content_Size 的帧时无法提前分配全局预算，直接回退单线程以确保 <= max_out。
+        tick_idle_vec(mt_states, mt_slots, mt_idle);
+        return decompress_with_state(state, data, out, max_out);
+    };
+    if total > avail || total < 256 * 1024 {
+        tick_idle_vec(mt_states, mt_slots, mt_idle);
+        return decompress_with_state(state, data, out, max_out);
     }
+    *mt_idle = 0;
 
     let nframes = spans.len();
     let active = workers.min(nframes);
@@ -258,7 +305,6 @@ pub(crate) fn decompress_parallel(
             Mutex::new((b, Ok(())))
         })
         .collect();
-    let frame_cap = max_out.saturating_sub(out.len());
     let next = AtomicUsize::new(0);
     let run_worker = |st: &mut State| {
         let mut tmp = Vec::new();
@@ -273,6 +319,7 @@ pub(crate) fn decompress_parallel(
             }
             tmp.clear();
             let sp = &spans[idx];
+            let frame_cap = sp.uncomp_len.expect("checked known") as usize;
             let res = decompress_with_state(st, &data[sp.start..sp.end], &mut tmp, frame_cap);
             {
                 let mut guard = slots[idx].lock().unwrap_or_else(|e| e.into_inner());
@@ -306,20 +353,17 @@ pub(crate) fn decompress_parallel(
         }
     }
     if !ok || out.len().saturating_add(total_out) > max_out {
-        for slot in slots {
-            let (mut buf, _) = slot.into_inner().unwrap_or_else(|e| e.into_inner());
-            buf.clear();
-            mt_slots.push(buf);
-        }
+        // 异常或超限路径不保留临时槽位缓冲，避免高水位内存滞留。
+        drop(slots);
         return decompress_with_state(state, data, out, max_out);
     }
 
     out.reserve(total_out);
+    let mut retained_bytes: usize = mt_slots.iter().map(Vec::capacity).sum();
     for slot in slots {
-        let (mut buf, _) = slot.into_inner().unwrap_or_else(|e| e.into_inner());
+        let (buf, _) = slot.into_inner().unwrap_or_else(|e| e.into_inner());
         out.extend_from_slice(&buf);
-        buf.clear();
-        mt_slots.push(buf);
+        retain_slots(mt_slots, buf, &mut retained_bytes);
     }
     Ok(())
 }

@@ -1,7 +1,7 @@
 //! 自适应 Zstd 编码器：
 //! - level 1..=4：无清零代际哈希表（Fast/DoubleFast），支持三重复偏移与位代价评分
 //! - level 5..=15：浅/深哈希链 + 1/2 步前瞻
-//! - level 16..=22：深哈希链 + 块内前向比特代价最优 DP
+//! - level 16..=22：二叉树后缀匹配 + 块内前向近似比特代价 DP
 //! - 零每块堆分配，完整支持 Raw/RLE/Compressed 块及 Predef/RLE/Custom/Repeat FSE 表。
 use crate::chain::{Chain, ChainCfg};
 use crate::dec::{LL_BASE, LL_DEFAULT, ML_BASE, ML_DEFAULT, OF_DEFAULT};
@@ -16,7 +16,7 @@ pub(crate) const BLOCK: usize = 128 * 1024;
 /// 压缩参数配置（支持等级、帧末尾 XXH64 校验和、可选窗口对数上限及多线程并行）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompressOptions {
-    /// 压缩等级：`<= 0` 仅存 Raw/RLE 块，`1..=4` 快速/双哈希，`5..=15` 哈希链前瞻，`16..=22` 最优 DP。
+    /// 压缩等级：`<= 0` 仅存 Raw/RLE 块，`1..=4` 快速/双哈希，`5..=15` 哈希链前瞻与二叉树，`16..=22` 启发式 DP。
     pub level: i32,
     /// 是否在帧尾写入 XXH64 低 32 位内容校验和（默认开启）。
     pub checksum: bool,
@@ -304,10 +304,13 @@ impl SymTable {
 
     #[inline(always)]
     fn step_state(&self, sym: u32, state: &mut u32) -> (u32, u32) {
+        const MASK32: [u32; 16] = [
+            0, 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767,
+        ];
         let s = sym as usize;
         let x = *state;
         let nb = (x + self.delta_nb[s]) >> 16;
-        let bits = x & ((1u32 << nb) - 1);
+        let bits = x & MASK32[(nb as usize) & 15];
         let x_occ = x >> nb;
         let next_idx = ((x_occ as i32 + self.sym_off[s] as i32) as usize) & 511;
         *state = self.state_table[next_idx] as u32;
@@ -340,15 +343,11 @@ enum CompKind {
 
 #[derive(Clone, Copy, Default)]
 struct SeqBits {
+    extra: u64,
     lc: u8,
     oc: u8,
     mc: u8,
-    lb: u8,
-    mb: u8,
-    ob: u8,
-    lv: u16,
-    mv: u16,
-    ov: u32,
+    eb: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -486,7 +485,42 @@ fn select_component(
     ModeSel::Predef
 }
 
+#[inline(never)]
 fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut Vec<u8>) {
+    const OC_MASK: [u32; 32] = [
+        0,
+        1,
+        3,
+        7,
+        15,
+        31,
+        63,
+        127,
+        255,
+        511,
+        1023,
+        2047,
+        4095,
+        8191,
+        16383,
+        32767,
+        65535,
+        0x1_FFFF,
+        0x3_FFFF,
+        0x7_FFFF,
+        0xF_FFFF,
+        0x1F_FFFF,
+        0x3F_FFFF,
+        0x7F_FFFF,
+        0xFF_FFFF,
+        0x1FF_FFFF,
+        0x3FF_FFFF,
+        0x7FF_FFFF,
+        0xFFF_FFFF,
+        0x1FFF_FFFF,
+        0x3FFF_FFFF,
+        0x7FFF_FFFF,
+    ];
     let mut cl = [0u32; 36];
     let mut co = [0u32; 32];
     let mut cm = [0u32; 53];
@@ -502,20 +536,17 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
             s.off + 3
         };
         let oc = 31 - ofv.leading_zeros();
-        let ov = ofv - (1 << oc);
+        let ov = ofv & OC_MASK[(oc as usize) & 31];
         cl[lc as usize] += 1;
         co[oc as usize] += 1;
         cm[mc as usize] += 1;
+        let extra = (lv as u64) | ((mv as u64) << lb) | ((ov as u64) << (lb + mb));
         sc.encoded.push(SeqBits {
+            extra,
             lc: lc as u8,
             oc: oc as u8,
             mc: mc as u8,
-            lb: lb as u8,
-            mb: mb as u8,
-            ob: oc as u8,
-            lv: lv as u16,
-            mv: mv as u16,
-            ov,
+            eb: (lb + mb + oc) as u8,
         });
     }
 
@@ -594,7 +625,7 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
     out.push(modes);
     out.extend_from_slice(&sc.desc);
 
-    let need = n * 12 + 32;
+    let need = n * 12 + 40;
     if sc.seq_buf.len() < need {
         sc.seq_buf.resize(need, 0);
     }
@@ -618,15 +649,22 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
     let mut sto = to.init_state(last.oc as u32);
     let mut stm = tm.init_state(last.mc as u32);
 
-    acc |= (last.lv as u64) | ((last.mv as u64) << last.lb);
-    nbits += last.lb as u32 + last.mb as u32;
-    flush64!();
-    acc |= (last.ov as u64) << nbits;
-    nbits += last.ob as u32;
-    flush64!();
+    let leb = last.eb as u32;
+    if leb <= 56 {
+        acc |= last.extra << nbits;
+        nbits += leb;
+        flush64!();
+    } else {
+        acc |= (last.extra & 0xFFFF_FFFF) << nbits;
+        nbits += 32;
+        flush64!();
+        acc |= (last.extra >> 32) << nbits;
+        nbits += leb - 32;
+        flush64!();
+    }
 
     for &sb in sc.encoded[..n - 1].iter().rev() {
-        if wp + 16 > buf.len() {
+        if wp + 24 > buf.len() {
             break;
         }
         let (n1, v1) = to.step_state(sb.oc as u32, &mut sto);
@@ -635,25 +673,27 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
 
         let fse = (v1 | (v2 << n1) | (v3 << (n1 + n2))) as u64;
         let fse_nb = n1 + n2 + n3;
-        let lb = sb.lb as u32;
-        let mb = sb.mb as u32;
-        let ob = sb.ob as u32;
-        let total = fse_nb + lb + mb + ob;
-        if total <= 56 {
-            let bits = fse
-                | ((sb.lv as u64) << fse_nb)
-                | ((sb.mv as u64) << (fse_nb + lb))
-                | ((sb.ov as u64) << (fse_nb + lb + mb));
-            acc |= bits << nbits;
-            nbits += total;
+        let eb = sb.eb as u32;
+        if fse_nb + eb <= 56 {
+            acc |= (fse | (sb.extra << fse_nb)) << nbits;
+            nbits += fse_nb + eb;
             flush64!();
         } else {
-            acc |= (fse | ((sb.lv as u64) << fse_nb)) << nbits;
-            nbits += fse_nb + lb;
+            acc |= fse << nbits;
+            nbits += fse_nb;
             flush64!();
-            acc |= ((sb.mv as u64) | ((sb.ov as u64) << mb)) << nbits;
-            nbits += mb + ob;
-            flush64!();
+            if eb <= 56 {
+                acc |= sb.extra << nbits;
+                nbits += eb;
+                flush64!();
+            } else {
+                acc |= (sb.extra & 0xFFFF_FFFF) << nbits;
+                nbits += 32;
+                flush64!();
+                acc |= (sb.extra >> 32) << nbits;
+                nbits += eb - 32;
+                flush64!();
+            }
         }
     }
 
@@ -756,6 +796,7 @@ pub(crate) struct EncCore {
     fast: Option<(FastMode, bool, bool)>, // (mode, tagged, wide)
     chain: Option<Chain<u32>>,
     wide_chain: Option<Chain<usize>>,
+    chain_idle: u8,
     seqs: Vec<Seq>,
     lits: Vec<u8>,
     body: Vec<u8>,
@@ -769,12 +810,32 @@ impl EncCore {
             fast: None,
             chain: None,
             wide_chain: None,
+            chain_idle: 0,
             seqs: Vec::with_capacity(4096),
             lits: Vec::with_capacity(32 * 1024),
             body: Vec::with_capacity(64 * 1024),
             huff: HuffScratch::new(),
             seq_sc: SeqScratch::new(),
         }
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.fast = None;
+        self.chain = None;
+        self.wide_chain = None;
+        self.chain_idle = 0;
+        self.seqs.clear();
+        self.seqs.shrink_to_fit();
+        self.lits.clear();
+        self.lits.shrink_to_fit();
+        self.body.clear();
+        self.body.shrink_to_fit();
+        self.seq_sc.desc.clear();
+        self.seq_sc.desc.shrink_to_fit();
+        self.seq_sc.encoded.clear();
+        self.seq_sc.encoded.shrink_to_fit();
+        self.seq_sc.seq_buf.clear();
+        self.seq_sc.seq_buf.shrink_to_fit();
     }
 }
 
@@ -784,6 +845,7 @@ pub struct Compressor {
     core: EncCore,
     mt_workers: Vec<EncCore>,
     mt_slots: Vec<Vec<u8>>,
+    mt_idle: u8,
 }
 
 impl Default for Compressor {
@@ -799,6 +861,31 @@ impl Compressor {
             core: EncCore::new(),
             mt_workers: Vec::new(),
             mt_slots: Vec::new(),
+            mt_idle: 0,
+        }
+    }
+
+    /// 释放匹配表、DP 工作集及并行工作池内存，保留当前压缩器可继续复用。
+    pub fn shrink_to_fit(&mut self) {
+        self.core.shrink_to_fit();
+        self.mt_workers.clear();
+        self.mt_workers.shrink_to_fit();
+        self.mt_slots.clear();
+        self.mt_slots.shrink_to_fit();
+        self.mt_idle = 0;
+    }
+
+    #[inline]
+    fn tick_mt_idle(&mut self) {
+        if !self.mt_workers.is_empty() || !self.mt_slots.is_empty() {
+            self.mt_idle = self.mt_idle.saturating_add(1);
+            if self.mt_idle >= 8 {
+                self.mt_workers.clear();
+                self.mt_workers.shrink_to_fit();
+                self.mt_slots.clear();
+                self.mt_slots.shrink_to_fit();
+                self.mt_idle = 0;
+            }
         }
     }
 
@@ -819,12 +906,14 @@ impl Compressor {
     /// 按 `opts` 将 `data` 压缩成一个或多个有效 Zstd 帧，追加写入 `out`。
     pub fn compress_into(&mut self, data: &[u8], out: &mut Vec<u8>, opts: &CompressOptions) {
         if opts.threads == 1 || data.len() < BLOCK * 4 {
+            self.tick_mt_idle();
             self.core.compress_single_frame(data, out, opts);
         } else {
             crate::mt::compress_parallel(
                 &mut self.core,
                 &mut self.mt_workers,
                 &mut self.mt_slots,
+                &mut self.mt_idle,
                 data,
                 out,
                 opts,
@@ -864,6 +953,14 @@ impl EncCore {
         if let Some(ref b) = budget {
             if level < 5 {
                 use_fast = true;
+                if self.chain.is_some() || self.wide_chain.is_some() {
+                    self.chain_idle = self.chain_idle.saturating_add(1);
+                    if self.chain_idle >= 8 {
+                        self.chain = None;
+                        self.wide_chain = None;
+                        self.chain_idle = 0;
+                    }
+                }
                 let active_bits = b.hash_bits.max(1);
                 let reuse_ok = self
                     .fast
@@ -880,12 +977,16 @@ impl EncCore {
                     f.prepare(data.len(), active_bits, fast_cfg.dual, win_limit);
                 }
             } else {
+                self.chain_idle = 0;
                 let cc = ChainCfg::from_budget(b, level, win_limit);
                 chain_cfg = Some(cc);
                 if wide {
                     let ch = self.wide_chain.get_or_insert_with(|| Chain::new(b));
                     ch.prepare(data.len(), b, cc.bt);
                 } else {
+                    if self.wide_chain.is_some() {
+                        self.wide_chain = None;
+                    }
                     let ch = self.chain.get_or_insert_with(|| Chain::new(b));
                     ch.prepare(data.len(), b, cc.bt);
                 }
@@ -898,9 +999,10 @@ impl EncCore {
         self.huff.reset_frame();
         self.seq_sc.reset_frame();
         let mut rep = [1usize, 4, 8];
+        let block_max = win_limit.min(BLOCK);
         let mut start = 0usize;
         while start < data.len() {
-            let end = (start + BLOCK).min(data.len());
+            let end = (start + block_max).min(data.len());
             let last = end == data.len();
             let blk = &data[start..end];
             if level <= 0 {
