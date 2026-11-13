@@ -1220,6 +1220,7 @@ fn block(
     };
 
     let seq_data = b.get(p..).unwrap_or(&[]);
+    let mut cur = RevCursor::new(seq_data)?;
     let block_base = out.len();
     let max_by_out = max_out.saturating_sub(block_base);
     let max_block_end = block_base + frame_rem.map_or(block_max, |rem| rem.min(block_max));
@@ -1228,8 +1229,6 @@ fn block(
             .map_or(max_by_out, |rem| rem.min(max_by_out))
             .min(block_max);
     out.resize(block_end_cap + 32, 0);
-
-    let mut cur = RevCursor::new(seq_data)?;
     let (mut sl, mut so, mut sm);
     let init_bits = st.ll_al + st.of_al + st.ml_al;
     let mut seq_idx = 0usize;

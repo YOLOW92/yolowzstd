@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 - 2026-11-13
+
+- Fix `src/dec.rs` block error rollback ordering: validate sequence bitstream header (`RevCursor::new(seq_data)?`) before resizing `out` to `block_end_cap + 32`, preventing incomplete block padding or `out.len() > max_out` leakage when `decompress_into` fails on truncated sequence streams.
+
 ## 0.1.1 - 2026-11-13
 
 - Parallel decompression budget & fallback (`src/mt.rs`): enforce combined frame output budgets within remaining `max_out` and fall back cleanly to single-thread decoding when any frame lacks `Frame_Content_Size`.

@@ -529,4 +529,19 @@ fn fcs_window_descriptor_and_parallel_budget_regressions() {
     let small = b"small reusable payload after shrink";
     let zs = comp.compress(small, 3);
     assert_eq!(dec.decompress(&zs, small.len()).unwrap(), small);
+
+    // 6. Corrupt sequence bitstream after valid sequence header must not leave expanded `out` (> max_out)
+    let mut bad_seq_frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0x20, 10];
+    // Non-last RLE block of 5 bytes ('q')
+    bad_seq_frame.extend_from_slice(&((5u32 << 3) | 2).to_le_bytes()[..3]);
+    bad_seq_frame.push(b'q');
+    // Last Compressed block with 1 raw literal ('x'), nseq=1, modes=0x00, but empty sequence bitstream
+    let bad_cbody = [0x08u8, b'x', 1, 0x00];
+    bad_seq_frame.extend_from_slice(&(((bad_cbody.len() as u32) << 3) | 5).to_le_bytes()[..3]);
+    bad_seq_frame.extend_from_slice(&bad_cbody);
+    let mut err_out = Vec::new();
+    let res = decompress_into(&bad_seq_frame, &mut err_out, 10);
+    assert!(matches!(res, Err(Error::Corrupt(_))));
+    assert_eq!(err_out, b"qqqqq");
+    assert!(err_out.len() <= 10);
 }
