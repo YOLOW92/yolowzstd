@@ -1087,16 +1087,7 @@ fn run_seq_loop(
     while seq_idx < limit && cur.cur >= 8 && cur.cur <= seq_data.len() {
         let max_cnt = (limit - seq_idx).min(32);
         let (cnt, long_hit) = decode_seq_batch(
-            &mut cur,
-            seq_data,
-            ll,
-            of,
-            ml,
-            &mut sl,
-            &mut so,
-            &mut sm,
-            &mut batch,
-            max_cnt,
+            &mut cur, seq_data, ll, of, ml, &mut sl, &mut so, &mut sm, &mut batch, max_cnt,
         );
         for &(llen, mlen, ofv) in &batch[..cnt] {
             let off = update_hist(ofv, llen, &mut hist);

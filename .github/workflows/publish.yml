@@ -44,6 +44,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cargo package --locked --no-verify
           crate_file=$(ls target/package/yolowzstd-*.crate | head -n 1)
           dir=$(dirname "$crate_file")
           name=$(basename "$crate_file")

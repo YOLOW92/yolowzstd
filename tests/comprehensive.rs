@@ -344,15 +344,24 @@ fn fcs_window_descriptor_and_parallel_budget_regressions() {
     };
     // Raw 20B when FCS=10 (also exceeds single-segment window_size=10)
     let raw_over = make_single_fcs_frame(10, (20 << 3) | 1, &[b'a'; 20]);
-    assert!(matches!(decompress(&raw_over, 1024), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        decompress(&raw_over, 1024),
+        Err(Error::Corrupt(_))
+    ));
 
     // RLE 20B when FCS=10
     let rle_over = make_single_fcs_frame(10, (20 << 3) | 3, b"a");
-    assert!(matches!(decompress(&rle_over, 1024), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        decompress(&rle_over, 1024),
+        Err(Error::Corrupt(_))
+    ));
 
     // Underflow: FCS=20 but RLE outputs 10B
     let underflow = make_single_fcs_frame(20, (10 << 3) | 3, b"a");
-    assert!(matches!(decompress(&underflow, 1024), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        decompress(&underflow, 1024),
+        Err(Error::Corrupt(_))
+    ));
 
     // Non-single-segment wlog=10 (Window_Size=1024), FCS=10, Raw block 20B -> Corrupt (not TooLarge!)
     let mut non_single_over = vec![0x28, 0xB5, 0x2F, 0xFD, 0x40, 0x00]; // Wait: fcs=1 needs 2-byte (+256), use fcs=4 (0x80)
@@ -394,12 +403,18 @@ fn fcs_window_descriptor_and_parallel_budget_regressions() {
     let mut wd_raw_over = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
     wd_raw_over.extend_from_slice(&((1025u32 << 3) | 1).to_le_bytes()[..3]);
     wd_raw_over.extend_from_slice(&[b'z'; 1025]);
-    assert!(matches!(decompress(&wd_raw_over, 8192), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        decompress(&wd_raw_over, 8192),
+        Err(Error::Corrupt(_))
+    ));
 
     let mut wd_rle_over = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
     wd_rle_over.extend_from_slice(&((1025u32 << 3) | 3).to_le_bytes()[..3]);
     wd_rle_over.push(b'z');
-    assert!(matches!(decompress(&wd_rle_over, 8192), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        decompress(&wd_rle_over, 8192),
+        Err(Error::Corrupt(_))
+    ));
 
     // Compressed block size 1025: valid at wdesc=0x08 (Window_Size=2048), Corrupt at wdesc=0x00 (1024)
     let make_comp_1025 = |wdesc: u8| -> Vec<u8> {
@@ -441,7 +456,10 @@ fn fcs_window_descriptor_and_parallel_budget_regressions() {
     // 3. Encoder window_log(Some(12)) on incompressible + compressible data -> zstd -d interop
     let mut mixed_200k = lcg(140_000, 777);
     mixed_200k.extend_from_slice(&structured_payload(60_000));
-    let z_w12 = compress_with(&mixed_200k, &CompressOptions::new(3).with_window_log(Some(12)));
+    let z_w12 = compress_with(
+        &mixed_200k,
+        &CompressOptions::new(3).with_window_log(Some(12)),
+    );
     assert_eq!(decompress(&z_w12, mixed_200k.len()).unwrap(), mixed_200k);
     if Command::new("zstd").arg("--version").output().is_ok() {
         let mut child = Command::new("zstd")
