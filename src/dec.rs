@@ -696,6 +696,57 @@ fn literals<'a>(
     Ok((None, regen, hl + comp))
 }
 
+fn build_seq_cells_into(probs: &[i16], al: u32, kind: Kind, out: &mut [SCell]) -> Result<()> {
+    let size = 1usize << al;
+    let cells = &mut out[..size];
+    let mut syms = [0u8; 512];
+    let mut high = size;
+    let mut next = [0u32; 64];
+    for (s, &p) in probs.iter().enumerate() {
+        if p == -1 {
+            high -= 1;
+            syms[high] = s as u8;
+            next[s] = 1;
+        } else {
+            next[s] = p.max(0) as u32;
+        }
+    }
+    let step = (size >> 1) + (size >> 3) + 3;
+    let mask = size - 1;
+    let mut pos = 0usize;
+    for (s, &p) in probs.iter().enumerate() {
+        for _ in 0..p.max(0) {
+            syms[pos] = s as u8;
+            pos = (pos + step) & mask;
+            while pos >= high {
+                pos = (pos + step) & mask;
+            }
+        }
+    }
+    if pos != 0 {
+        return Err(Error::Corrupt("fse table spread"));
+    }
+    for (d, &sym_u8) in cells.iter_mut().zip(&syms[..size]) {
+        let sym = sym_u8 as usize;
+        let x = next[sym];
+        next[sym] = x + 1;
+        let nb = al - (31 - x.leading_zeros());
+        let base = ((x << nb) - size as u32) as u16;
+        let (val, eb) = match kind {
+            Kind::Ll => LL_BASE[sym.min(LL_BASE.len() - 1)],
+            Kind::Ml => ML_BASE[sym.min(ML_BASE.len() - 1)],
+            Kind::Of => (1u32 << sym.min(31), sym.min(31) as u32),
+        };
+        *d = SCell {
+            base,
+            nb: nb as u8,
+            eb: eb as u8,
+            val,
+        };
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_seq_table(
     mode: u8,
@@ -736,12 +787,9 @@ fn prepare_seq_table(
         }
         2 => {
             let tail = data.get(*pos..).unwrap_or(&[]);
-            let mut probs = [0i16; 256];
+            let mut probs = [0i16; 64];
             let (plen, table_al, used) = fse::read_dist_into(tail, max_sym, max_al, &mut probs)?;
-            let mut fse_cells = [fse::Cell::default(); 512];
-            let size = 1usize << table_al;
-            fse::build_into(&probs[..plen], table_al, &mut fse_cells[..size])?;
-            expand_cells(&fse_cells[..size], kind, &mut cells[..size]);
+            build_seq_cells_into(&probs[..plen], table_al, kind, cells)?;
             *pos += used;
             *src = TableSrc::Custom;
             *al = table_al;
@@ -765,7 +813,8 @@ fn copy_long_lits(dst: &mut [u8], pos: usize, lits: &[u8], lp: usize, llen: usiz
 #[inline(never)]
 fn copy_long_match(dst: &mut [u8], p: usize, from: usize, off: usize, mlen: usize) {
     if off >= mlen {
-        dst.copy_within(from + 16..from + mlen, p + 16);
+        let (head, tail) = dst.split_at_mut(p);
+        tail[16..mlen].copy_from_slice(&head[from + 16..from + mlen]);
     } else {
         let mut d = 16usize;
         while d < mlen {
@@ -778,9 +827,30 @@ fn copy_long_match(dst: &mut [u8], p: usize, from: usize, off: usize, mlen: usiz
 
 #[cold]
 #[inline(never)]
+fn copy_short_off_tail(dst: &mut [u8], p: usize, off: usize, mlen: usize) {
+    const STEP16: [usize; 16] = [
+        0, 16, 16, 18, 16, 20, 18, 21, 16, 18, 20, 22, 24, 26, 28, 30,
+    ];
+    let step = STEP16[off];
+    let mut d = 16usize;
+    while d < mlen {
+        let wp = p + d;
+        let (head, tail) = dst.split_at_mut(wp);
+        tail[..16].copy_from_slice(&head[wp - step..wp - step + 16]);
+        d += 16;
+    }
+}
+
+#[cold]
+#[inline(never)]
 fn copy_short_off(dst: &mut [u8], p: usize, from: usize, off: usize, mlen: usize) {
     const DEC32: [usize; 8] = [0, 1, 2, 1, 4, 4, 4, 4];
     const DEC64: [usize; 8] = [8, 8, 8, 7, 8, 9, 10, 11];
+    if off == 1 {
+        let b = dst[from];
+        dst[p..p + mlen].fill(b);
+        return;
+    }
     if off >= 8 {
         let (h1, t1) = dst.split_at_mut(p);
         t1[..8].copy_from_slice(&h1[from..from + 8]);
@@ -803,17 +873,7 @@ fn copy_short_off(dst: &mut [u8], p: usize, from: usize, off: usize, mlen: usize
         }
     }
     if mlen > 16 {
-        const STEP16: [usize; 16] = [
-            0, 16, 16, 18, 16, 20, 18, 21, 16, 18, 20, 22, 24, 26, 28, 30,
-        ];
-        let step = STEP16[off];
-        let mut d = 16usize;
-        while d < mlen {
-            let wp = p + d;
-            let (head, tail) = dst.split_at_mut(wp);
-            tail[..16].copy_from_slice(&head[wp - step..wp - step + 16]);
-            d += 16;
-        }
+        copy_short_off_tail(dst, p, off, mlen);
     }
 }
 
@@ -992,7 +1052,7 @@ struct SeqLoopState {
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn decode_seq_batch(
-    cur: &mut RevCursor,
+    bit_pos: &mut usize,
     seq_data: &[u8],
     ll: &[SCell; 512],
     of: &[SCell; 256],
@@ -1004,12 +1064,12 @@ fn decode_seq_batch(
     max_cnt: usize,
 ) -> (usize, bool) {
     let mut cnt = 0usize;
-    let mut c = *cur;
+    let mut bp = *bit_pos;
     let mut l = *sl;
     let mut o = *so;
     let mut m = *sm;
     let mut long_hit = false;
-    while cnt < max_cnt && c.cur >= 8 && c.cur <= seq_data.len() {
+    while cnt < max_cnt && bp >= 57 {
         let cl = ll[l & 511];
         let co = of[o & 255];
         let cm = ml[m & 511];
@@ -1023,9 +1083,12 @@ fn decode_seq_batch(
             long_hit = true;
             break;
         }
-        let raw = c.load_msb(seq_data);
+        let byte_end = (bp + 7) >> 3;
+        let bit_off = (bp.wrapping_neg() & 7) as u32;
+        let raw =
+            u64::from_le_bytes(seq_data[byte_end - 8..byte_end].try_into().unwrap()) << bit_off;
         let v = (raw >> 8) >> (56 - total_bits);
-        c.advance(total_bits);
+        bp -= total_bits as usize;
 
         let ev = v >> tn;
         let uo = v & mask64(no);
@@ -1042,7 +1105,7 @@ fn decode_seq_batch(
         batch[cnt] = (cl.val + xl as u32, cm.val + xm as u32, co.val + xo as u32);
         cnt += 1;
     }
-    *cur = c;
+    *bit_pos = bp;
     *sl = l;
     *so = o;
     *sm = m;
@@ -1070,6 +1133,11 @@ fn run_seq_loop(
     let Some(lit_len) = lits.len().checked_sub(16) else {
         return Ok(());
     };
+    if s.cur.cur < 8 || s.cur.cur > seq_data.len() {
+        return Ok(());
+    }
+    let seq_data = &seq_data[..s.cur.cur];
+    let mut bit_pos = s.cur.cur * 8 - s.cur.bit_off as usize;
     let mut seq_idx = s.seq_idx;
     let mut sl = s.sl;
     let mut so = s.so;
@@ -1077,17 +1145,22 @@ fn run_seq_loop(
     let mut lp = s.lp;
     let mut pos = s.pos;
     let mut hist = s.hist;
-    let mut cur = RevCursor {
-        cur: s.cur.cur,
-        bit_off: s.cur.bit_off,
-    };
 
     let limit = nseq.saturating_sub(1);
     let mut batch = [(0u32, 0u32, 0u32); 32];
-    while seq_idx < limit && cur.cur >= 8 && cur.cur <= seq_data.len() {
+    while seq_idx < limit && bit_pos >= 57 {
         let max_cnt = (limit - seq_idx).min(32);
         let (cnt, long_hit) = decode_seq_batch(
-            &mut cur, seq_data, ll, of, ml, &mut sl, &mut so, &mut sm, &mut batch, max_cnt,
+            &mut bit_pos,
+            seq_data,
+            ll,
+            of,
+            ml,
+            &mut sl,
+            &mut so,
+            &mut sm,
+            &mut batch,
+            max_cnt,
         );
         for &(llen, mlen, ofv) in &batch[..cnt] {
             let off = update_hist(ofv, llen, &mut hist);
@@ -1119,7 +1192,10 @@ fn run_seq_loop(
     s.lp = lp;
     s.pos = pos;
     s.hist = hist;
-    s.cur = cur;
+    s.cur = RevCursor {
+        cur: (bit_pos + 7) >> 3,
+        bit_off: (bit_pos.wrapping_neg() & 7) as u32,
+    };
     Ok(())
 }
 

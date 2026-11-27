@@ -16,7 +16,9 @@ mod henc;
 mod huff;
 mod lz;
 mod mt;
+mod opt;
 mod resources;
+mod row;
 mod xxh;
 
 pub use dec::{

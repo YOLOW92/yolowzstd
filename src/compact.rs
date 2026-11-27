@@ -1,7 +1,8 @@
 //! 缓存驻留输入保留紧凑位置表（支持代际戳记与三重复偏移），不为标签增加额外空间占用。
 use crate::enc::Seq;
 use crate::lz::{
-    FastCfg, MIN, Position, apply_rep, h_long, h_short, match_score, mlen, probe_reps, rd,
+    FastCfg, MIN, Position, apply_rep, h_4, h_long, h_short, match_first, match_score, mlen,
+    probe_reps, rd, rd4,
 };
 
 pub(crate) struct Compact<P> {
@@ -163,11 +164,365 @@ impl<P: Position> Compact<P> {
         seqs: &mut Vec<Seq>,
         lits: &mut Vec<u8>,
     ) -> usize {
-        if cfg.dual && !self.long.is_empty() {
+        if !cfg.dual && !cfg.all_reps && cfg.lazy_limit == 0 && cfg.min_match == 5 {
+            self.parse_fast_l1(d, (start, end), cfg, rep, seqs, lits)
+        } else if cfg.dual && cfg.lazy_limit == 0 && !self.long.is_empty() {
+            if cfg.min_match >= 5 {
+                self.parse_dfast::<true>(d, (start, end), cfg, rep, seqs, lits)
+            } else {
+                self.parse_dfast::<false>(d, (start, end), cfg, rep, seqs, lits)
+            }
+        } else if cfg.dual && !self.long.is_empty() {
             self.parse_inner::<true>(d, (start, end), cfg, rep, seqs, lits)
         } else {
             self.parse_inner::<false>(d, (start, end), cfg, rep, seqs, lits)
         }
+    }
+
+    #[inline(never)]
+    fn parse_fast_l1(
+        &mut self,
+        d: &[u8],
+        (start, end): (usize, usize),
+        _cfg: FastCfg,
+        rep: &mut [usize; 3],
+        seqs: &mut Vec<Seq>,
+        lits: &mut Vec<u8>,
+    ) -> usize {
+        if end > d.len() {
+            return start;
+        }
+        let d = &d[..end];
+        let base = self.base;
+        let win = self.window_limit;
+        let bits = self.active_bits;
+        let mask = (1usize << bits) - 1;
+        let short = &mut self.short[..=mask];
+        let (mut i, mut anchor) = (start, start);
+
+        while i + 8 <= end {
+            let mut off = 0usize;
+            let mut len = 0usize;
+            let mut is_rep_next = false;
+
+            {
+                let r0 = rep[0];
+                if r0 >= 1 && r0 <= i + 1 && r0 <= win && rd4(d, i + 1 - r0) == rd4(d, i + 1) {
+                    off = r0;
+                    len = 4 + mlen(d, i + 1 - r0 + 4, i + 5, end);
+                    is_rep_next = true;
+                }
+            }
+
+            if len == 0 {
+                let mut step = 1usize;
+                let mut next_bump = i + 8;
+                while i + 8 <= end {
+                    let v = rd(d, i);
+                    let hs = h_short(v, bits) & mask;
+                    let raw = short[hs].to_raw();
+                    short[hs] = P::from_raw(base + i + 1);
+                    if raw > base {
+                        let c = raw - base - 1;
+                        if c < i && i - c <= win {
+                            let diff = rd(d, c) ^ v;
+                            if (diff & 0x00FF_FFFF_FFFF) == 0 {
+                                off = i - c;
+                                let tail = ((diff >> 40) as u32).trailing_zeros() >> 3;
+                                len = if tail < 3 {
+                                    5 + tail as usize
+                                } else {
+                                    8 + mlen(d, c + 8, i + 8, end)
+                                };
+                                break;
+                            }
+                        }
+                    }
+                    i += step;
+                    if i >= next_bump {
+                        step = 2 + ((i - anchor) >> 4);
+                        next_bump = i + 16;
+                    }
+                }
+                if len == 0 {
+                    break;
+                }
+            }
+
+            if is_rep_next {
+                i += 1;
+                while i > anchor + 1 && off < i && d[i - 1] == d[i - off - 1] {
+                    i -= 1;
+                    len += 1;
+                }
+            } else {
+                while i > anchor && off < i && d[i - 1] == d[i - off - 1] {
+                    i -= 1;
+                    len += 1;
+                }
+            }
+            let ll = i - anchor;
+            lits.extend_from_slice(&d[anchor..i]);
+            let rep_code = apply_rep(rep, ll, off);
+            seqs.push(Seq {
+                ll: ll as u32,
+                ml: len as u32,
+                off: off as u32,
+                rep_code,
+            });
+            let next_i = i + len;
+            if len > 4 && next_i >= 2 && next_i + 6 <= end {
+                let vp = rd(d, next_i - 2);
+                short[h_short(vp, bits) & mask] = P::from_raw(base + next_i - 1);
+            }
+            i = next_i;
+            anchor = i;
+            while i + 8 <= end {
+                let r1 = rep[1];
+                if r1 >= 1 && r1 <= i && r1 <= win && rd4(d, i - r1) == rd4(d, i) {
+                    let rlen = 4 + mlen(d, i - r1 + 4, i + 4, end);
+                    let rcode = apply_rep(rep, 0, r1);
+                    seqs.push(Seq {
+                        ll: 0,
+                        ml: rlen as u32,
+                        off: r1 as u32,
+                        rep_code: rcode,
+                    });
+                    let ni = i + rlen;
+                    if ni >= 2 && ni + 6 <= end {
+                        let vp = rd(d, ni - 2);
+                        short[h_short(vp, bits) & mask] = P::from_raw(base + ni - 1);
+                    }
+                    i = ni;
+                    anchor = i;
+                } else {
+                    break;
+                }
+            }
+        }
+        anchor
+    }
+
+    #[inline(never)]
+    fn parse_dfast<const SHORT5: bool>(
+        &mut self,
+        d: &[u8],
+        (start, end): (usize, usize),
+        _cfg: FastCfg,
+        rep: &mut [usize; 3],
+        seqs: &mut Vec<Seq>,
+        lits: &mut Vec<u8>,
+    ) -> usize {
+        if end > d.len() {
+            return start;
+        }
+        let d = &d[..end];
+        let base = self.base;
+        let win = self.window_limit;
+        let bits = self.active_bits;
+        let mask = (1usize << bits) - 1;
+        let short = &mut self.short[..=mask];
+        let long = &mut self.long[..=mask];
+        let (mut i, mut anchor) = (start, start);
+
+        while i + 8 <= end {
+            let mut off = 0usize;
+            let mut len = 0usize;
+            let mut is_rep_next = false;
+
+            {
+                let r0 = rep[0];
+                if r0 >= 1 && r0 <= i + 1 && r0 <= win && rd4(d, i + 1 - r0) == rd4(d, i + 1) {
+                    off = r0;
+                    len = 4 + mlen(d, i + 1 - r0 + 4, i + 5, end);
+                    is_rep_next = true;
+                }
+            }
+
+            if len == 0 {
+                let mut step = 1usize;
+                let mut next_bump = i + 64;
+                while i + 8 <= end {
+                    let v = rd(d, i);
+                    let v4 = v as u32;
+                    let hl = h_long(v, bits) & mask;
+                    let hs = if SHORT5 {
+                        h_short(v, bits) & mask
+                    } else {
+                        h_4(v4, bits) & mask
+                    };
+                    let cl = long[hl].to_raw();
+                    let cs = short[hs].to_raw();
+                    let pv = P::from_raw(base + i + 1);
+                    long[hl] = pv;
+                    short[hs] = pv;
+
+                    if cl > base {
+                        let c = cl - base - 1;
+                        if c < i && i - c <= win {
+                            let l = match_first(d, c, i, end, v);
+                            if l >= MIN {
+                                off = i - c;
+                                len = l;
+                                break;
+                            }
+                        }
+                    }
+
+                    if cs > base {
+                        let c = cs - base - 1;
+                        if c < i && i - c <= win {
+                            let l = match_first(d, c, i, end, v);
+                            let o = i - c;
+                            let ok = if SHORT5 {
+                                l >= 5
+                            } else {
+                                l >= 5 || (l == 4 && o < (1 << 17))
+                            };
+                            if ok {
+                                off = o;
+                                len = l;
+                                if i + 9 <= end {
+                                    let v_nx = rd(d, i + 1);
+                                    let hl2 = h_long(v_nx, bits) & mask;
+                                    let cl2 = long[hl2].to_raw();
+                                    let p2 = P::from_raw(base + i + 2);
+                                    long[hl2] = p2;
+                                    let mut take_nx = false;
+                                    if cl2 > base {
+                                        let c2 = cl2 - base - 1;
+                                        if c2 <= i && (i + 1 - c2) <= win {
+                                            let l2 = match_first(d, c2, i + 1, end, v_nx);
+                                            let o2 = i + 1 - c2;
+                                            if l2 > len + 1
+                                                || (l2 == len + 1 && o2 < off.saturating_mul(8))
+                                                || (l2 == len && o2.saturating_mul(16) < off)
+                                            {
+                                                i += 1;
+                                                off = o2;
+                                                len = l2;
+                                                take_nx = true;
+                                            }
+                                        }
+                                    }
+                                    if !take_nx && len < 12 {
+                                        let hs2 = if SHORT5 {
+                                            h_short(v_nx, bits) & mask
+                                        } else {
+                                            h_4(v_nx as u32, bits) & mask
+                                        };
+                                        let cs2 = short[hs2].to_raw();
+                                        short[hs2] = p2;
+                                        if cs2 > base {
+                                            let c2 = cs2 - base - 1;
+                                            if c2 <= i && (i + 1 - c2) <= win {
+                                                let l2 = match_first(d, c2, i + 1, end, v_nx);
+                                                let o2 = i + 1 - c2;
+                                                if l2 > len + 1
+                                                    || (l2 == len + 1 && o2 < off.saturating_mul(8))
+                                                    || (l2 == len && o2.saturating_mul(16) < off)
+                                                {
+                                                    i += 1;
+                                                    off = o2;
+                                                    len = l2;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    i += step;
+                    if i >= next_bump {
+                        step += 1;
+                        next_bump = i + 64;
+                    }
+                }
+                if len == 0 {
+                    break;
+                }
+            }
+
+            if is_rep_next {
+                i += 1;
+                while i > anchor + 1 && off < i && d[i - 1] == d[i - off - 1] {
+                    i -= 1;
+                    len += 1;
+                }
+            } else {
+                while i > anchor && off < i && d[i - 1] == d[i - off - 1] {
+                    i -= 1;
+                    len += 1;
+                }
+            }
+            let ll = i - anchor;
+            lits.extend_from_slice(&d[anchor..i]);
+            let rep_code = apply_rep(rep, ll, off);
+            seqs.push(Seq {
+                ll: ll as u32,
+                ml: len as u32,
+                off: off as u32,
+                rep_code,
+            });
+            let next_i = i + len;
+            if i + 9 <= end {
+                let v1 = rd(d, i + 1);
+                let p1 = P::from_raw(base + i + 2);
+                let hs1 = if SHORT5 {
+                    h_short(v1, bits) & mask
+                } else {
+                    h_4(v1 as u32, bits) & mask
+                };
+                short[hs1] = p1;
+                long[h_long(v1, bits) & mask] = p1;
+            }
+            if len > 4 && next_i >= 2 && next_i + 6 <= end {
+                let vp = rd(d, next_i - 2);
+                let pp = P::from_raw(base + next_i - 1);
+                let hsp = if SHORT5 {
+                    h_short(vp, bits) & mask
+                } else {
+                    h_4(vp as u32, bits) & mask
+                };
+                short[hsp] = pp;
+                long[h_long(vp, bits) & mask] = pp;
+            }
+            i = next_i;
+            anchor = i;
+            while i + 8 <= end {
+                let r1 = rep[1];
+                if r1 >= 1 && r1 <= i && r1 <= win && rd4(d, i - r1) == rd4(d, i) {
+                    let rlen = 4 + mlen(d, i - r1 + 4, i + 4, end);
+                    let rcode = apply_rep(rep, 0, r1);
+                    seqs.push(Seq {
+                        ll: 0,
+                        ml: rlen as u32,
+                        off: r1 as u32,
+                        rep_code: rcode,
+                    });
+                    let ni = i + rlen;
+                    if ni >= 2 && ni + 6 <= end {
+                        let vp = rd(d, ni - 2);
+                        let pp = P::from_raw(base + ni - 1);
+                        let hsp = if SHORT5 {
+                            h_short(vp, bits) & mask
+                        } else {
+                            h_4(vp as u32, bits) & mask
+                        };
+                        short[hsp] = pp;
+                        long[h_long(vp, bits) & mask] = pp;
+                    }
+                    i = ni;
+                    anchor = i;
+                } else {
+                    break;
+                }
+            }
+        }
+        anchor
     }
 
     #[inline(never)]
@@ -221,7 +576,7 @@ impl<P: Position> Compact<P> {
             }
             if len > 4 {
                 self.put::<DUAL>(d, i + len - 2);
-                if cfg.extra_puts >= 2 {
+                if cfg.extra_puts >= 3 {
                     self.put::<DUAL>(d, i + len - 1);
                 }
             }

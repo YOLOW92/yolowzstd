@@ -15,6 +15,12 @@ fn merge(h: u64, v: u64) -> u64 {
     (h ^ round(0, v)).wrapping_mul(P1).wrapping_add(P4)
 }
 
+#[inline(always)]
+fn r64_arr(b: &[u8; 8]) -> u64 {
+    u64::from_le_bytes(*b)
+}
+
+#[inline(always)]
 fn r64(b: &[u8]) -> u64 {
     u64::from_le_bytes(b[..8].try_into().expect("8 字节"))
 }
@@ -25,13 +31,15 @@ pub(crate) fn xxh64(data: &[u8]) -> u64 {
     if data.len() >= 32 {
         let (mut v1, mut v2, mut v3, mut v4) =
             (P1.wrapping_add(P2), P2, 0u64, 0u64.wrapping_sub(P1));
-        while rest.len() >= 32 {
-            v1 = round(v1, r64(rest));
-            v2 = round(v2, r64(&rest[8..]));
-            v3 = round(v3, r64(&rest[16..]));
-            v4 = round(v4, r64(&rest[24..]));
-            rest = &rest[32..];
+        let (chunks, rem) = data.as_chunks::<32>();
+        for c in chunks {
+            let (lanes, _) = c.as_chunks::<8>();
+            v1 = round(v1, r64_arr(&lanes[0]));
+            v2 = round(v2, r64_arr(&lanes[1]));
+            v3 = round(v3, r64_arr(&lanes[2]));
+            v4 = round(v4, r64_arr(&lanes[3]));
         }
+        rest = rem;
         h = v1
             .rotate_left(1)
             .wrapping_add(v2.rotate_left(7))

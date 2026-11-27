@@ -66,12 +66,17 @@ pub(crate) fn rd(d: &[u8], p: usize) -> u64 {
 
 #[inline(always)]
 pub(crate) fn h_long(v: u64, bits: u32) -> usize {
-    (v.wrapping_mul(PRIME) >> (64 - bits)) as usize
+    ((v << 8).wrapping_mul(PRIME) >> (64 - bits)) as usize
 }
 
 #[inline(always)]
 pub(crate) fn h_short(v: u64, bits: u32) -> usize {
-    h_long(v << 24, bits)
+    ((v << 24).wrapping_mul(PRIME) >> (64 - bits)) as usize
+}
+
+#[inline(always)]
+pub(crate) fn h_4(v4: u32, bits: u32) -> usize {
+    (((v4 as u64).wrapping_mul(PRIME)) >> (64 - bits)) as usize
 }
 
 #[inline(always)]
@@ -258,7 +263,7 @@ impl FastCfg {
                 dual: false,
                 min_match: 5,
                 lazy_limit: 0,
-                miss_shift: 5,
+                miss_shift: 4,
                 extra_puts: 1,
                 all_reps: false,
             },
@@ -266,23 +271,23 @@ impl FastCfg {
                 dual: false,
                 min_match: 4,
                 lazy_limit: 0,
-                miss_shift: 5,
+                miss_shift: 6,
                 extra_puts: 2,
-                all_reps: true,
+                all_reps: false,
             },
             3 => Self {
                 dual: true,
                 min_match: 4,
-                lazy_limit: 12,
-                miss_shift: 5,
+                lazy_limit: 0,
+                miss_shift: 6,
                 extra_puts: 2,
-                all_reps: true,
+                all_reps: false,
             },
             _ => Self {
                 dual: true,
                 min_match: 4,
-                lazy_limit: 24,
-                miss_shift: 6,
+                lazy_limit: 16,
+                miss_shift: 7,
                 extra_puts: 2,
                 all_reps: true,
             },
@@ -508,6 +513,12 @@ impl<P: Position> Fast<P> {
     ) -> usize {
         if !cfg.dual && !cfg.all_reps && cfg.lazy_limit == 0 && cfg.min_match == 5 {
             self.parse_fast_l1(d, (start, end), cfg, rep, seqs, lits)
+        } else if cfg.dual && cfg.lazy_limit == 0 && !self.long.is_empty() {
+            if cfg.min_match >= 5 {
+                self.parse_dfast::<true>(d, (start, end), cfg, rep, seqs, lits)
+            } else {
+                self.parse_dfast::<false>(d, (start, end), cfg, rep, seqs, lits)
+            }
         } else if cfg.dual && !self.long.is_empty() {
             self.parse_inner::<true>(d, (start, end), cfg, rep, seqs, lits)
         } else {
@@ -520,7 +531,7 @@ impl<P: Position> Fast<P> {
         &mut self,
         d: &[u8],
         (start, end): (usize, usize),
-        cfg: FastCfg,
+        _cfg: FastCfg,
         rep: &mut [usize; 3],
         seqs: &mut Vec<Seq>,
         lits: &mut Vec<u8>,
@@ -532,52 +543,73 @@ impl<P: Position> Fast<P> {
         let base = self.base;
         let win = self.window_limit;
         let bits = self.active_bits;
-        let miss_shift = cfg.miss_shift;
-        let (mut i, mut anchor, mut miss) = (start, start, 0usize);
-        while i + 8 <= end {
-            let v = rd(d, i);
-            let v4 = v as u32;
-            let hs = h_short(v, bits);
-            let cs = self.short[hs];
-            self.short[hs] = P::candidate(base + i + 1, v4);
+        let mask = (1usize << bits) - 1;
+        let short = &mut self.short[..=mask];
+        let (mut i, mut anchor) = (start, start);
 
+        while i + 8 <= end {
             let mut off = 0usize;
             let mut len = 0usize;
-            if miss <= 1 {
-                let r0 = if i > anchor { rep[0] } else { rep[1] };
-                if r0 >= 1 && r0 <= i && r0 <= win && rd4(d, i - r0) == v4 {
+            let mut is_rep_next = false;
+
+            // 仅在紧邻上条匹配处做一次 i+1 的 rep[0] 探测，避免污染内层 miss 循环
+            {
+                let r0 = rep[0];
+                if r0 >= 1 && r0 <= i + 1 && r0 <= win && rd4(d, i + 1 - r0) == rd4(d, i + 1) {
                     off = r0;
-                    len = 4 + mlen(d, i - r0 + 4, i + 4, end);
+                    len = 4 + mlen(d, i + 1 - r0 + 4, i + 5, end);
+                    is_rep_next = true;
                 }
             }
+
             if len == 0 {
-                let (raw, first) = P::unpack(cs);
-                if first == v4 && raw > base {
-                    let c = raw - base - 1;
-                    if c < i && i - c <= win {
-                        let vc = rd(d, c);
-                        let diff = vc ^ v;
-                        if (diff & 0x00FF_FFFF_FFFF) == 0 {
-                            off = i - c;
-                            let tail = ((diff >> 40) as u32).trailing_zeros() >> 3;
-                            len = if tail < 3 {
-                                5 + tail as usize
-                            } else {
-                                8 + mlen(d, c + 8, i + 8, end)
-                            };
+                let mut step = 1usize;
+                let mut next_bump = i + 8;
+                while i + 8 <= end {
+                    let v = rd(d, i);
+                    let v4 = v as u32;
+                    let hs = h_short(v, bits) & mask;
+                    let cs = short[hs];
+                    short[hs] = P::candidate(base + i + 1, v4);
+                    let (raw, first) = P::unpack(cs);
+                    if first == v4 && raw > base {
+                        let c = raw - base - 1;
+                        if c < i && i - c <= win {
+                            let diff = rd(d, c) ^ v;
+                            if (diff & 0x00FF_FFFF_FFFF) == 0 {
+                                off = i - c;
+                                let tail = ((diff >> 40) as u32).trailing_zeros() >> 3;
+                                len = if tail < 3 {
+                                    5 + tail as usize
+                                } else {
+                                    8 + mlen(d, c + 8, i + 8, end)
+                                };
+                                break;
+                            }
                         }
                     }
+                    i += step;
+                    if i >= next_bump {
+                        step = 2 + ((i - anchor) >> 4);
+                        next_bump = i + 16;
+                    }
+                }
+                if len == 0 {
+                    break;
                 }
             }
-            if len == 0 {
-                i += 1 + (miss >> miss_shift);
-                miss += 1;
-                continue;
-            }
-            miss = 0;
-            while i > anchor && off < i && d[i - 1] == d[i - off - 1] {
-                i -= 1;
-                len += 1;
+
+            if is_rep_next {
+                i += 1;
+                while i > anchor + 1 && off < i && d[i - 1] == d[i - off - 1] {
+                    i -= 1;
+                    len += 1;
+                }
+            } else {
+                while i > anchor && off < i && d[i - 1] == d[i - off - 1] {
+                    i -= 1;
+                    len += 1;
+                }
             }
             let ll = i - anchor;
             lits.extend_from_slice(&d[anchor..i]);
@@ -588,11 +620,268 @@ impl<P: Position> Fast<P> {
                 off: off as u32,
                 rep_code,
             });
-            if len > 4 {
-                self.put::<false>(d, i + len - 2);
+            let next_i = i + len;
+            if len > 4 && next_i >= 2 && next_i + 6 <= end {
+                let vp = rd(d, next_i - 2);
+                short[h_short(vp, bits) & mask] = P::candidate(base + next_i - 1, vp as u32);
             }
-            i += len;
+            i = next_i;
             anchor = i;
+            // 连续 0-literal rep[1] 链式快检
+            while i + 8 <= end {
+                let r1 = rep[1];
+                if r1 >= 1 && r1 <= i && r1 <= win && rd4(d, i - r1) == rd4(d, i) {
+                    let rlen = 4 + mlen(d, i - r1 + 4, i + 4, end);
+                    let rcode = apply_rep(rep, 0, r1);
+                    seqs.push(Seq {
+                        ll: 0,
+                        ml: rlen as u32,
+                        off: r1 as u32,
+                        rep_code: rcode,
+                    });
+                    let ni = i + rlen;
+                    if ni >= 2 && ni + 6 <= end {
+                        let vp = rd(d, ni - 2);
+                        short[h_short(vp, bits) & mask] = P::candidate(base + ni - 1, vp as u32);
+                    }
+                    i = ni;
+                    anchor = i;
+                } else {
+                    break;
+                }
+            }
+        }
+        anchor
+    }
+
+    /// 双哈希快速匹配器（DoubleFast，L3）：极简无 rep 内层 miss 循环 + 4/5B 短表 + 7B 长表 + i+1 率失真前瞻。
+    #[inline(never)]
+    fn parse_dfast<const SHORT5: bool>(
+        &mut self,
+        d: &[u8],
+        (start, end): (usize, usize),
+        _cfg: FastCfg,
+        rep: &mut [usize; 3],
+        seqs: &mut Vec<Seq>,
+        lits: &mut Vec<u8>,
+    ) -> usize {
+        if end > d.len() {
+            return start;
+        }
+        let d = &d[..end];
+        let base = self.base;
+        let win = self.window_limit;
+        let bits = self.active_bits;
+        let mask = (1usize << bits) - 1;
+        let short = &mut self.short[..=mask];
+        let long = &mut self.long[..=mask];
+        let (mut i, mut anchor) = (start, start);
+
+        while i + 8 <= end {
+            let mut off = 0usize;
+            let mut len = 0usize;
+            let mut is_rep_next = false;
+
+            // 紧邻上条匹配处单次探测 i+1 的 rep[0]
+            {
+                let r0 = rep[0];
+                if r0 >= 1 && r0 <= i + 1 && r0 <= win && rd4(d, i + 1 - r0) == rd4(d, i + 1) {
+                    off = r0;
+                    len = 4 + mlen(d, i + 1 - r0 + 4, i + 5, end);
+                    is_rep_next = true;
+                }
+            }
+
+            if len == 0 {
+                let mut step = 1usize;
+                let mut next_bump = i + 64;
+                while i + 8 <= end {
+                    let v = rd(d, i);
+                    let v4 = v as u32;
+                    let hl = h_long(v, bits) & mask;
+                    let hs = if SHORT5 {
+                        h_short(v, bits) & mask
+                    } else {
+                        h_4(v4, bits) & mask
+                    };
+                    let cl = long[hl];
+                    let cs = short[hs];
+                    let cand = P::candidate(base + i + 1, v4);
+                    long[hl] = cand;
+                    short[hs] = cand;
+
+                    // 1) 长表命中（7B 哈希）
+                    let (raw_l, first_l) = P::unpack(cl);
+                    if first_l == v4 && raw_l > base {
+                        let c = raw_l - base - 1;
+                        if c < i && i - c <= win {
+                            let l = match_first(d, c, i, end, v);
+                            if l >= MIN {
+                                off = i - c;
+                                len = l;
+                                break;
+                            }
+                        }
+                    }
+
+                    // 2) 短表命中（4/5B 哈希）：命中时对 i+1 做长/短率失真前瞻
+                    let (raw_s, first_s) = P::unpack(cs);
+                    if first_s == v4 && raw_s > base {
+                        let c = raw_s - base - 1;
+                        if c < i && i - c <= win {
+                            let l = match_first(d, c, i, end, v);
+                            let o = i - c;
+                            let ok = if SHORT5 {
+                                l >= 5
+                            } else {
+                                l >= 5 || (l == 4 && o < (1 << 17))
+                            };
+                            if ok {
+                                off = o;
+                                len = l;
+                                if i + 9 <= end {
+                                    let v_nx = rd(d, i + 1);
+                                    let v4_nx = v_nx as u32;
+                                    let hl2 = h_long(v_nx, bits) & mask;
+                                    let cl2 = long[hl2];
+                                    let cand2 = P::candidate(base + i + 2, v4_nx);
+                                    long[hl2] = cand2;
+                                    let mut take_nx = false;
+                                    let (raw2, first2) = P::unpack(cl2);
+                                    if first2 == v4_nx && raw2 > base {
+                                        let c2 = raw2 - base - 1;
+                                        if c2 <= i && (i + 1 - c2) <= win {
+                                            let l2 = match_first(d, c2, i + 1, end, v_nx);
+                                            let o2 = i + 1 - c2;
+                                            if l2 > len + 1
+                                                || (l2 == len + 1 && o2 < off.saturating_mul(8))
+                                                || (l2 == len && o2.saturating_mul(16) < off)
+                                            {
+                                                i += 1;
+                                                off = o2;
+                                                len = l2;
+                                                take_nx = true;
+                                            }
+                                        }
+                                    }
+                                    if !take_nx && len < 12 {
+                                        let hs2 = if SHORT5 {
+                                            h_short(v_nx, bits) & mask
+                                        } else {
+                                            h_4(v4_nx, bits) & mask
+                                        };
+                                        let cs2 = short[hs2];
+                                        short[hs2] = cand2;
+                                        let (raw2, first2) = P::unpack(cs2);
+                                        if first2 == v4_nx && raw2 > base {
+                                            let c2 = raw2 - base - 1;
+                                            if c2 <= i && (i + 1 - c2) <= win {
+                                                let l2 = match_first(d, c2, i + 1, end, v_nx);
+                                                let o2 = i + 1 - c2;
+                                                if l2 > len + 1
+                                                    || (l2 == len + 1 && o2 < off.saturating_mul(8))
+                                                    || (l2 == len && o2.saturating_mul(16) < off)
+                                                {
+                                                    i += 1;
+                                                    off = o2;
+                                                    len = l2;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    i += step;
+                    if i >= next_bump {
+                        step += 1;
+                        next_bump = i + 64;
+                    }
+                }
+                if len == 0 {
+                    break;
+                }
+            }
+
+            if is_rep_next {
+                i += 1;
+                while i > anchor + 1 && off < i && d[i - 1] == d[i - off - 1] {
+                    i -= 1;
+                    len += 1;
+                }
+            } else {
+                while i > anchor && off < i && d[i - 1] == d[i - off - 1] {
+                    i -= 1;
+                    len += 1;
+                }
+            }
+            let ll = i - anchor;
+            lits.extend_from_slice(&d[anchor..i]);
+            let rep_code = apply_rep(rep, ll, off);
+            seqs.push(Seq {
+                ll: ll as u32,
+                ml: len as u32,
+                off: off as u32,
+                rep_code,
+            });
+            let next_i = i + len;
+            if i + 9 <= end {
+                let v1 = rd(d, i + 1);
+                let c1 = P::candidate(base + i + 2, v1 as u32);
+                let hs1 = if SHORT5 {
+                    h_short(v1, bits) & mask
+                } else {
+                    h_4(v1 as u32, bits) & mask
+                };
+                short[hs1] = c1;
+                long[h_long(v1, bits) & mask] = c1;
+            }
+            if len > 4 && next_i >= 2 && next_i + 6 <= end {
+                let vp = rd(d, next_i - 2);
+                let cp = P::candidate(base + next_i - 1, vp as u32);
+                let hsp = if SHORT5 {
+                    h_short(vp, bits) & mask
+                } else {
+                    h_4(vp as u32, bits) & mask
+                };
+                short[hsp] = cp;
+                long[h_long(vp, bits) & mask] = cp;
+            }
+            i = next_i;
+            anchor = i;
+            // 连续 0-literal rep[1] 链式快检
+            while i + 8 <= end {
+                let r1 = rep[1];
+                if r1 >= 1 && r1 <= i && r1 <= win && rd4(d, i - r1) == rd4(d, i) {
+                    let rlen = 4 + mlen(d, i - r1 + 4, i + 4, end);
+                    let rcode = apply_rep(rep, 0, r1);
+                    seqs.push(Seq {
+                        ll: 0,
+                        ml: rlen as u32,
+                        off: r1 as u32,
+                        rep_code: rcode,
+                    });
+                    let ni = i + rlen;
+                    if ni >= 2 && ni + 6 <= end {
+                        let vp = rd(d, ni - 2);
+                        let cp = P::candidate(base + ni - 1, vp as u32);
+                        let hsp = if SHORT5 {
+                            h_short(vp, bits) & mask
+                        } else {
+                            h_4(vp as u32, bits) & mask
+                        };
+                        short[hsp] = cp;
+                        long[h_long(vp, bits) & mask] = cp;
+                    }
+                    i = ni;
+                    anchor = i;
+                } else {
+                    break;
+                }
+            }
         }
         anchor
     }
@@ -671,7 +960,7 @@ mod tests {
     fn compact_and_wide_tables_agree() {
         let data = b"<div class=\"entry\">alpha beta gamma</div>\n".repeat(1000);
         for bits in [1, 8, 14] {
-            for level in [1, 3] {
+            for level in [1, 2, 3, 4] {
                 let cfg = FastCfg::for_level(level);
                 let (mut a, mut b) = (
                     Fast::<u32>::new(cfg.dual, bits),

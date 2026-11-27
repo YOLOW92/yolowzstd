@@ -20,8 +20,9 @@ pub(crate) fn read_dist_into(
     data: &[u8],
     max_sym: usize,
     max_al: u32,
-    probs: &mut [i16; 256],
+    probs: &mut [i16],
 ) -> Result<(usize, u32, usize)> {
+    let max_sym = max_sym.min(probs.len().saturating_sub(1));
     let mut r = FwdBits::new(data);
     let al = r.read(4) + 5;
     if al > max_al {

@@ -1,8 +1,6 @@
-//! 哈希链/二叉树匹配器与前向启发式动态规划解析器：
-//! - level 5..=8：浅链 + 1 步前瞻
-//! - level 9..=11：深链 + 2 步前瞻
-//! - level 12..=15：二叉树后缀匹配器 + 前瞻
-//! - level 16..=22：二叉树后缀匹配器 + 块内近似比特代价前向启发式 DP（Zstd 3-rep）
+//! 哈希链与后缀二叉搜索树（BST）匹配器：
+//! - level 12..=15（及超大输入回退路径）：后缀二叉搜索树（Pavlov/Collet 子树拼接 + 跨块字典序不变量）+ 2 步率失真前瞻；
+//! - level 16..=22 的熵代价最优解析器见 [`crate::opt`]。
 use crate::enc::Seq;
 use crate::lz::{MIN, Position, apply_rep, h_long, match_score, mlen, probe_reps, rd, rd4};
 use crate::resources::Budget;
@@ -18,7 +16,6 @@ pub(crate) struct ChainCfg {
     pub sufficient: usize,
     pub lazy_steps: u8,
     pub bt: bool,
-    pub optimal: bool,
     pub window_limit: usize,
 }
 
@@ -27,16 +24,14 @@ impl ChainCfg {
         let sufficient = match level {
             ..=8 => 64,
             9..=11 => 96,
-            12..=15 => 256,
             _ => 256,
         };
         let bt = level >= 12;
         let depth = match level {
             ..=8 => b.depth,
             9..=11 => 16,
-            12..=15 => 24,
-            16..=18 => 48,
-            _ => 64,
+            12..=15 => 32,
+            _ => 48,
         };
         let lazy_steps = if level >= 9 { 2 } else { 1 };
         Self {
@@ -44,33 +39,9 @@ impl ChainCfg {
             sufficient,
             lazy_steps,
             bt,
-            optimal: level >= 16,
             window_limit: window_limit.min((u32::MAX - 3) as usize),
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct DpNode {
-    cost: u32,
-    prev: u32,
-    mlen: u32,
-    off: u32,
-    rep_code: u8,
-    last_lit: bool,
-    rep: [usize; 3],
-}
-
-impl DpNode {
-    const INF: Self = Self {
-        cost: u32::MAX,
-        prev: 0,
-        mlen: 0,
-        off: 0,
-        rep_code: 0,
-        last_lit: false,
-        rep: [1, 4, 8],
-    };
 }
 
 pub(crate) struct Chain<P> {
@@ -85,9 +56,6 @@ pub(crate) struct Chain<P> {
     next_base: usize,
     local_span: usize,
     next: usize,
-    dp: Vec<DpNode>,
-    dp_idle: u8,
-    back_ops: Vec<(u32, u32, u8)>, // (pos_or_lit_len, off, rep_code) 逆序复用缓冲
 }
 
 impl<P: Position> Chain<P> {
@@ -106,9 +74,6 @@ impl<P: Position> Chain<P> {
             next_base: 0,
             local_span: budget.local_span.max(1),
             next: 0,
-            dp: Vec::new(),
-            dp_idle: 0,
-            back_ops: Vec::new(),
         }
     }
 
@@ -249,26 +214,14 @@ impl<P: Position> Chain<P> {
         seqs: &mut Vec<Seq>,
         lits: &mut Vec<u8>,
     ) -> usize {
-        if cfg.optimal && range.1 - range.0 >= 64 {
-            self.dp_idle = 0;
-            self.parse_opt(d, range, cfg, rep, seqs, lits)
+        if cfg.bt {
+            self.parse_bt_lazy(d, range, cfg, rep, seqs, lits)
         } else {
-            if self.dp.capacity() > 0 {
-                self.dp_idle = self.dp_idle.saturating_add(1);
-                if self.dp_idle >= 4 {
-                    self.dp = Vec::new();
-                    self.dp_idle = 0;
-                }
-            }
-            if cfg.bt {
-                self.parse_bt_lazy(d, range, cfg, rep, seqs, lits)
-            } else {
-                self.parse_lazy(d, range, cfg, rep, seqs, lits)
-            }
+            self.parse_lazy(d, range, cfg, rep, seqs, lits)
         }
     }
 
-    /// 将位置 `p` 插入二叉搜索树并同步收集后缀匹配（`< p` 的严格左/右子树，无自环与越界风险）。
+    /// 将位置 `p` 插入二叉搜索树并同步收集后缀匹配（Pavlov/Collet 子树拼接 + 跨块完整字典序比较）。
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn bt_step<const COLLECT: bool>(
@@ -286,27 +239,14 @@ impl<P: Position> Chain<P> {
         if p + MIN > end {
             return;
         }
+        let d_len = d.len();
         let base = self.base;
         let bits = self.active_bits;
         let wmask = self.win_mask;
         let win_cap = wmask + 1;
         let new_pv = P::from_raw(base + p + 1);
-        if p + 8 <= end {
-            let hl = h_long(rd(d, p), bits);
-            let old_l = self.long[hl].to_raw();
-            self.long[hl] = new_pv;
-            if COLLECT && old_l > base {
-                let c = old_l - base - 1;
-                if c < p && p - c <= win_limit && p - c < win_cap {
-                    let ml = mlen(d, c, p, end);
-                    if ml >= MIN && ml > *max_ml && *nc < cands.len() {
-                        *max_ml = ml;
-                        cands[*nc] = (ml, p - c, 0);
-                        *nc += 1;
-                    }
-                }
-            }
-        }
+        let blk_cap = end - p;
+
         let v32 = rd4(d, p);
         let h = h4(v32, bits);
         let mut raw = self.head[h].to_raw();
@@ -322,34 +262,41 @@ impl<P: Position> Chain<P> {
             if raw <= base {
                 self.prev[smaller_slot] = P::EMPTY;
                 self.prev[larger_slot] = P::EMPTY;
-                return;
+                break;
             }
             let c = raw - base - 1;
             if c >= p || p - c > win_limit || p - c >= win_cap {
                 self.prev[smaller_slot] = P::EMPTY;
                 self.prev[larger_slot] = P::EMPTY;
-                return;
+                break;
             }
             let m_common = common_smaller.min(common_larger);
-            let ml = if m_common == 0 && c + 8 <= end && p + 8 <= end {
+            let ml = if m_common == 0 && c + 8 <= d_len && p + 8 <= d_len {
                 let diff = rd(d, c) ^ rd(d, p);
                 if diff != 0 {
                     (diff.trailing_zeros() >> 3) as usize
                 } else {
-                    8 + mlen(d, c + 8, p + 8, end)
+                    8 + mlen(d, c + 8, p + 8, d_len)
                 }
             } else {
-                m_common + mlen(d, c + m_common, p + m_common, end)
+                m_common + mlen(d, c + m_common, p + m_common, d_len)
             };
-            if COLLECT && ml >= MIN && ml > *max_ml && *nc < cands.len() {
-                *max_ml = ml;
-                cands[*nc] = (ml, p - c, 0);
+            let blk_ml = ml.min(blk_cap);
+            if COLLECT && blk_ml >= MIN && blk_ml > *max_ml && *nc < cands.len() {
+                *max_ml = blk_ml;
+                cands[*nc] = (blk_ml, p - c, 0);
                 *nc += 1;
             }
-            if p + ml >= end || ml >= sufficient {
-                self.prev[smaller_slot] = P::EMPTY;
-                self.prev[larger_slot] = P::EMPTY;
-                return;
+            if ml >= sufficient {
+                // Pavlov/Collet 精确子树拼接：所有 bt_step 共享同一 sufficient 阈值，保留 c 的左右子树
+                let c_slot = (c & wmask) * 2;
+                self.prev[smaller_slot] = self.prev[c_slot];
+                self.prev[larger_slot] = self.prev[c_slot + 1];
+                smaller_slot = usize::MAX;
+                break;
+            }
+            if p + ml >= d_len {
+                break;
             }
             if d[c + ml] < d[p + ml] {
                 self.prev[smaller_slot] = P::from_raw(raw);
@@ -363,8 +310,28 @@ impl<P: Position> Chain<P> {
                 raw = self.prev[larger_slot].to_raw();
             }
         }
-        self.prev[smaller_slot] = P::EMPTY;
-        self.prev[larger_slot] = P::EMPTY;
+        if smaller_slot != usize::MAX {
+            self.prev[smaller_slot] = P::EMPTY;
+            self.prev[larger_slot] = P::EMPTY;
+        }
+
+        // 7B 长表放于 BST 之后查询：绝不遮蔽 BST 收集到的更近距帕累托候选
+        if p + 8 <= d_len {
+            let hl = h_long(rd(d, p), bits);
+            let old_l = self.long[hl].to_raw();
+            self.long[hl] = new_pv;
+            if COLLECT && old_l > base {
+                let c = old_l - base - 1;
+                if c < p && p - c <= win_limit && p - c < win_cap {
+                    let ml = mlen(d, c, p, end);
+                    if ml >= MIN && ml > *max_ml && *nc < cands.len() {
+                        *max_ml = ml;
+                        cands[*nc] = (ml, p - c, 0);
+                        *nc += 1;
+                    }
+                }
+            }
+        }
     }
 
     #[inline(always)]
@@ -416,7 +383,6 @@ impl<P: Position> Chain<P> {
         if end > d.len() {
             return start;
         }
-        let d = &d[..end];
         let (mut i, mut anchor, mut miss) = (start, start, 0usize);
         let mut dummy = [(0usize, 0usize, 0u8); 1];
         while i + MIN <= end {
@@ -462,7 +428,7 @@ impl<P: Position> Chain<P> {
                     p,
                     end,
                     8,
-                    64,
+                    cfg.sufficient,
                     cfg.window_limit,
                     &mut dummy,
                     &mut nc,
@@ -538,268 +504,6 @@ impl<P: Position> Chain<P> {
             i = stop;
             anchor = i;
         }
-        anchor
-    }
-
-    /// 块内前向启发式比特代价 DP 解析（近似估算字面量与序列比特代价并追踪 3 个重复偏移，匹配段超过 `sufficient` 时直接跨跳）。
-    #[inline(never)]
-    fn parse_opt(
-        &mut self,
-        d: &[u8],
-        (start, end): (usize, usize),
-        cfg: ChainCfg,
-        rep: &mut [usize; 3],
-        seqs: &mut Vec<Seq>,
-        lits: &mut Vec<u8>,
-    ) -> usize {
-        let n = end - start;
-        let blk = &d[start..end];
-        let mut freq = [0u32; 256];
-        for &b in blk {
-            freq[b as usize] += 1;
-        }
-        let mut lit_cost = [24u32; 256]; // 以 1/4 比特为单位
-        let nf = n as f32;
-        for (s, &c) in freq.iter().enumerate() {
-            let bits = (nf / c.max(1) as f32).log2().clamp(1.0, 8.0);
-            lit_cost[s] = (bits * 4.0).round() as u32;
-        }
-
-        let mut dp_buf = std::mem::take(&mut self.dp);
-        if dp_buf.len() <= n {
-            dp_buf.resize(n + 1, DpNode::INF);
-        }
-        let dp = &mut dp_buf[..=n];
-        dp.fill(DpNode::INF);
-        dp[0] = DpNode {
-            cost: 0,
-            prev: 0,
-            mlen: 0,
-            off: 0,
-            rep_code: 0,
-            last_lit: false,
-            rep: *rep,
-        };
-
-        let win = (self.win_mask).min(cfg.window_limit);
-        let _ = self.local_span;
-
-        #[inline(always)]
-        fn seq_cost(ml: usize, off: usize, rep_code: u8) -> u32 {
-            let off_bits = match rep_code {
-                1 => 4,
-                2 => 10,
-                3 => 14,
-                _ => ((31 - (off as u32).saturating_add(3).leading_zeros()) << 2) + 8,
-            };
-            let ml_bits = if ml >= 43 {
-                10
-            } else if ml >= 19 {
-                6
-            } else {
-                3
-            };
-            20 + ml_bits + off_bits
-        }
-
-        // 记录收集到的帕累托匹配候选 (mlen, off, rep_code)
-        let mut cands = [(0usize, 0usize, 0u8); 24];
-        let mut dummy = [(0usize, 0usize, 0u8); 1];
-        let mut idx = 0usize;
-        while idx < n {
-            let cur_node = dp[idx];
-            if cur_node.cost == u32::MAX {
-                idx += 1;
-                continue;
-            }
-            let pos = start + idx;
-
-            // 1) 字面量转移 idx -> idx + 1
-            let next_lit_cost = cur_node.cost + lit_cost[blk[idx] as usize];
-            if next_lit_cost < dp[idx + 1].cost {
-                dp[idx + 1] = DpNode {
-                    cost: next_lit_cost,
-                    prev: idx as u32,
-                    mlen: 0,
-                    off: 0,
-                    rep_code: 0,
-                    last_lit: true,
-                    rep: cur_node.rep,
-                };
-            }
-
-            if pos + MIN > end {
-                idx += 1;
-                continue;
-            }
-
-            // 2) 收集本地位置的所有有效重复与二叉搜索树帕累托匹配候选
-            let mut nc = 0usize;
-            let mut max_ml = 0usize;
-            let rep_list: [(usize, u8); 3] = if cur_node.last_lit {
-                [
-                    (cur_node.rep[0], 1),
-                    (cur_node.rep[1], 2),
-                    (cur_node.rep[2], 3),
-                ]
-            } else {
-                [
-                    (cur_node.rep[1], 1),
-                    (cur_node.rep[2], 2),
-                    (cur_node.rep[0].saturating_sub(1), 3),
-                ]
-            };
-            let v32 = rd4(d, pos);
-            for &(ro, rcode) in &rep_list {
-                if ro >= 1 && ro <= pos && ro <= win && rd4(d, pos - ro) == v32 {
-                    let ml = 4 + mlen(d, pos - ro + 4, pos + 4, end);
-                    cands[nc] = (ml, ro, rcode);
-                    nc += 1;
-                    if ml > max_ml {
-                        max_ml = ml;
-                    }
-                }
-            }
-            if pos >= self.next {
-                self.bt_step::<true>(
-                    d,
-                    pos,
-                    end,
-                    cfg.depth,
-                    cfg.sufficient,
-                    cfg.window_limit,
-                    &mut cands,
-                    &mut nc,
-                    &mut max_ml,
-                );
-            }
-
-            if nc == 0 {
-                idx += 1;
-                continue;
-            }
-
-            // 足够长的匹配（>= sufficient）：直接采用并跨越整个区间，避免 O(N^2) 弛豫。
-            if max_ml >= cfg.sufficient && pos + max_ml <= end {
-                let &(best_ml, best_off, _) =
-                    cands[..nc].iter().max_by_key(|x| x.0).expect("nonempty");
-                let mut next_rep = cur_node.rep;
-                let rc = apply_rep(&mut next_rep, usize::from(cur_node.last_lit), best_off);
-                let sc = cur_node.cost + seq_cost(best_ml, best_off, rc);
-                let dst = idx + best_ml;
-                if sc < dp[dst].cost {
-                    dp[dst] = DpNode {
-                        cost: sc,
-                        prev: idx as u32,
-                        mlen: best_ml as u32,
-                        off: best_off as u32,
-                        rep_code: rc,
-                        last_lit: false,
-                        rep: next_rep,
-                    };
-                }
-                let stop_pos = pos + best_ml;
-                let stride = (best_ml / 12).max(1);
-                let mut p = self.next.max(pos + 1);
-                while p + MIN <= end && p < stop_pos {
-                    let mut dn = 0;
-                    let mut dm = 0;
-                    self.bt_step::<false>(
-                        d,
-                        p,
-                        end,
-                        8,
-                        64,
-                        cfg.window_limit,
-                        &mut dummy,
-                        &mut dn,
-                        &mut dm,
-                    );
-                    p += stride;
-                }
-                self.next = self.next.max(stop_pos);
-                idx = dst;
-                continue;
-            }
-
-            // 按每个候选弛豫完整长度及短前缀（最多到 16），确保相邻匹配与重叠截断最优。
-            for &(cand_ml, off, _) in &cands[..nc] {
-                let mut next_rep = cur_node.rep;
-                let rc = apply_rep(&mut next_rep, usize::from(cur_node.last_lit), off);
-                let prefix_end = cand_ml.min(16);
-                for len in MIN..=prefix_end {
-                    let dst = idx + len;
-                    let sc = cur_node.cost + seq_cost(len, off, rc);
-                    if sc < dp[dst].cost {
-                        dp[dst] = DpNode {
-                            cost: sc,
-                            prev: idx as u32,
-                            mlen: len as u32,
-                            off: off as u32,
-                            rep_code: rc,
-                            last_lit: false,
-                            rep: next_rep,
-                        };
-                    }
-                }
-                if cand_ml > 16 {
-                    let dst = idx + cand_ml;
-                    let sc = cur_node.cost + seq_cost(cand_ml, off, rc);
-                    if sc < dp[dst].cost {
-                        dp[dst] = DpNode {
-                            cost: sc,
-                            prev: idx as u32,
-                            mlen: cand_ml as u32,
-                            off: off as u32,
-                            rep_code: rc,
-                            last_lit: false,
-                            rep: next_rep,
-                        };
-                    }
-                }
-            }
-            idx += 1;
-        }
-
-        // 回溯还原操作序列（可能末尾含若干字面量，留给调用方按 anchor..end 输出）
-        self.back_ops.clear();
-        let mut cur_idx = n;
-        let mut trailing_lits = 0usize;
-        while cur_idx > 0 && dp[cur_idx].mlen == 0 {
-            trailing_lits += 1;
-            cur_idx = dp[cur_idx].prev as usize;
-        }
-        let anchor = end - trailing_lits;
-        while cur_idx > 0 {
-            let node = dp[cur_idx];
-            if node.mlen == 0 {
-                self.back_ops.push((0, 0, 0));
-            } else {
-                self.back_ops.push((node.mlen, node.off, node.rep_code));
-            }
-            cur_idx = node.prev as usize;
-        }
-        self.dp = dp_buf;
-        let mut pos = start;
-        let mut cur_anchor = start;
-        for &(ml, off, _) in self.back_ops.iter().rev() {
-            if ml == 0 {
-                pos += 1;
-            } else {
-                let ll = pos - cur_anchor;
-                lits.extend_from_slice(&d[cur_anchor..pos]);
-                let rc = apply_rep(rep, ll, off as usize);
-                seqs.push(Seq {
-                    ll: ll as u32,
-                    ml,
-                    off,
-                    rep_code: rc,
-                });
-                pos += ml as usize;
-                cur_anchor = pos;
-            }
-        }
-        debug_assert_eq!(cur_anchor, anchor);
         anchor
     }
 }

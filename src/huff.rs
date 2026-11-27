@@ -1,4 +1,4 @@
-//! Huffman 字面量：零分配权重解析、11 位展开解码表、4 路/单路 64 位批处理解码。
+//! Huffman 字面量：零分配权重解析、11 位单/双符号展开解码表、4 路/单路 64 位批处理解码。
 use crate::bits::{RevBits, RevCursor};
 use crate::fse;
 use crate::{Error, Result};
@@ -6,11 +6,48 @@ use crate::{Error, Result};
 #[derive(Clone)]
 pub(crate) struct HuffTable {
     pub entries: [u16; 2048],
+    /// 2 符号 11 位展开表（8 KiB，L1d 驻留，每次 64 位装载可解 5 次 = 最多 10 字节）：
+    /// `bits 0..8 = sym0`, `bits 8..16 = sym1`, `bits 16..20 = total_nb (1..=11)`, `bit 24 = (count - 1)`。
+    pub pair_entries: [u32; 2048],
+    pub pair_ready: bool,
+    /// 按树结构精确计算的 P(l0+l1 <= 11) 收益判定。
+    pub pair_worth: bool,
 }
 
 impl Default for HuffTable {
     fn default() -> Self {
-        Self { entries: [0; 2048] }
+        Self {
+            entries: [0; 2048],
+            pair_entries: [0; 2048],
+            pair_ready: false,
+            pair_worth: false,
+        }
+    }
+}
+
+impl HuffTable {
+    /// 按需构造 11 位 2 符号查找表（每棵新树最多构造一次，Repeat 块零重建）。
+    #[inline(never)]
+    fn ensure_pair_table(&mut self) {
+        if self.pair_ready {
+            return;
+        }
+        let entries = &self.entries;
+        let pair = &mut self.pair_entries;
+        for idx in 0..2048usize {
+            let e0 = entries[idx];
+            let s0 = (e0 >> 8) as u32;
+            let l0 = (e0 & 15) as u32;
+            let e1 = entries[(idx << l0) & 2047];
+            let l1 = (e1 & 15) as u32;
+            if l0 + l1 <= 11 {
+                let s1 = (e1 >> 8) as u32;
+                pair[idx] = s0 | (s1 << 8) | ((l0 + l1) << 16) | (1 << 24);
+            } else {
+                pair[idx] = s0 | (l0 << 16);
+            }
+        }
+        self.pair_ready = true;
     }
 }
 
@@ -127,17 +164,32 @@ pub(crate) fn read_tree_into(data: &[u8], table: &mut HuffTable) -> Result<usize
     }
 
     let entries = &mut table.entries;
+    let mut len_mass = [0u64; 12];
     for (sym, &w) in weights[..n].iter().enumerate() {
         if w > 0 {
             let wu = w as usize;
             let nb = (max_bits as u16) + 1 - (wu as u16);
             let val = ((sym as u16) << 8) | nb;
             let len = 1usize << (11 - nb as usize);
+            len_mass[nb as usize] += len as u64;
             let p = rank_pos[wu];
             entries[p..p + len].fill(val);
             rank_pos[wu] = p + len;
         }
     }
+    let mut cum = [0u64; 12];
+    let mut acc = 0u64;
+    for l in 1..=11 {
+        acc += len_mass[l];
+        cum[l] = acc;
+    }
+    let mut pair_hit_num = 0u64;
+    for l1 in 1..=10 {
+        pair_hit_num += len_mass[l1] * cum[11 - l1];
+    }
+    table.pair_ready = false;
+    // 精确双符号命中率 P(l1 + l2 <= 11) = pair_hit_num / 2048^2；>= 42% 时 11 位双符号表显著提速。
+    table.pair_worth = pair_hit_num >= ((2048u64 * 2048 * 42) / 100);
     Ok(used)
 }
 
@@ -156,7 +208,8 @@ fn finish_stream(entries: &[u16; 2048], r: &mut RevBits<'_>, tail: &mut [u8]) ->
 
 fn decode_single_stream(entries: &[u16; 2048], data: &[u8], out: &mut [u8]) -> Result<()> {
     let mut cur = RevCursor::new(data)?;
-    let (chunks, _) = out.as_chunks_mut::<4>();
+    let data = &data[..cur.cur.min(data.len())];
+    let (chunks, _) = out.as_chunks_mut::<5>();
     let mut done_chunks = 0usize;
     for chunk in chunks {
         if cur.cur < 8 {
@@ -174,17 +227,21 @@ fn decode_single_stream(entries: &[u16; 2048], data: &[u8], out: &mut [u8]) -> R
         b <<= l2;
         let e3 = entries[(b >> 53) as usize];
         let l3 = (e3 & 15) as u32;
-        cur.advance(l0 + l1 + l2 + l3);
+        b <<= l3;
+        let e4 = entries[(b >> 53) as usize];
+        let l4 = (e4 & 15) as u32;
+        cur.advance(l0 + l1 + l2 + l3 + l4);
         *chunk = [
             (e0 >> 8) as u8,
             (e1 >> 8) as u8,
             (e2 >> 8) as u8,
             (e3 >> 8) as u8,
+            (e4 >> 8) as u8,
         ];
         done_chunks += 1;
     }
     let mut r = cur.into_rev(data);
-    finish_stream(entries, &mut r, &mut out[done_chunks * 4..])
+    finish_stream(entries, &mut r, &mut out[done_chunks * 5..])
 }
 
 fn stream_parts(data: &[u8], n: usize) -> Result<([&[u8]; 4], usize)> {
@@ -209,12 +266,14 @@ fn stream_parts(data: &[u8], n: usize) -> Result<([&[u8]; 4], usize)> {
     Ok((parts, seg))
 }
 
-pub(crate) fn decode_into(t: &HuffTable, data: &[u8], four: bool, out: &mut [u8]) -> Result<()> {
-    let entries = &t.entries;
-    if !four {
-        return decode_single_stream(entries, data, out);
-    }
-    let (parts, seg) = stream_parts(data, out.len())?;
+#[inline(never)]
+fn decode_4x2(
+    pair: &[u32; 2048],
+    entries: &[u16; 2048],
+    parts: [&[u8]; 4],
+    seg: usize,
+    out: &mut [u8],
+) -> Result<()> {
     let (pa, pb, pc, pd) = (parts[0], parts[1], parts[2], parts[3]);
     let (mut ca, mut cb, mut cc, mut cd) = (
         RevCursor::new(pa)?,
@@ -226,10 +285,149 @@ pub(crate) fn decode_into(t: &HuffTable, data: &[u8], four: bool, out: &mut [u8]
     let (ob, rest) = rest.split_at_mut(seg);
     let (oc, od) = rest.split_at_mut(seg);
 
-    let (oa_c, _) = oa.as_chunks_mut::<4>();
-    let (ob_c, _) = ob.as_chunks_mut::<4>();
-    let (oc_c, _) = oc.as_chunks_mut::<4>();
-    let (od_c, _) = od.as_chunks_mut::<4>();
+    let pa = &pa[..ca.cur.min(pa.len())];
+    let pb = &pb[..cb.cur.min(pb.len())];
+    let pc = &pc[..cc.cur.min(pc.len())];
+    let pd = &pd[..cd.cur.min(pd.len())];
+
+    let mut wpa = 0usize;
+    let mut wpb = 0usize;
+    let mut wpc = 0usize;
+    let mut wpd = 0usize;
+
+    if let (Some(la), Some(lb), Some(lc), Some(ld)) = (
+        oa.len().checked_sub(10),
+        ob.len().checked_sub(10),
+        oc.len().checked_sub(10),
+        od.len().checked_sub(10),
+    ) {
+        macro_rules! pair_step {
+            ($ba:ident, $bb:ident, $bc:ident, $bd:ident,
+             $ta:ident, $tb:ident, $tc:ident, $td:ident,
+             $wa:ident, $wb:ident, $wc:ident, $wd:ident,
+             $ia:ident, $ib:ident, $ic:ident, $id:ident) => {{
+                let ea = pair[($ba >> 53) as usize];
+                let eb = pair[($bb >> 53) as usize];
+                let ec = pair[($bc >> 53) as usize];
+                let ed = pair[($bd >> 53) as usize];
+
+                let na = (ea >> 16) & 15;
+                let nb = (eb >> 16) & 15;
+                let nc = (ec >> 16) & 15;
+                let nd = (ed >> 16) & 15;
+
+                $ba <<= na;
+                $bb <<= nb;
+                $bc <<= nc;
+                $bd <<= nd;
+                $ta += na;
+                $tb += nb;
+                $tc += nc;
+                $td += nd;
+
+                $wa[$ia] = ea as u8;
+                $wa[$ia + 1] = (ea >> 8) as u8;
+                $ia += 1 + ((ea >> 24) & 1) as usize;
+
+                $wb[$ib] = eb as u8;
+                $wb[$ib + 1] = (eb >> 8) as u8;
+                $ib += 1 + ((eb >> 24) & 1) as usize;
+
+                $wc[$ic] = ec as u8;
+                $wc[$ic + 1] = (ec >> 8) as u8;
+                $ic += 1 + ((ec >> 24) & 1) as usize;
+
+                $wd[$id] = ed as u8;
+                $wd[$id + 1] = (ed >> 8) as u8;
+                $id += 1 + ((ed >> 24) & 1) as usize;
+            }};
+        }
+
+        while wpa <= la
+            && wpb <= lb
+            && wpc <= lc
+            && wpd <= ld
+            && ca.cur.min(cb.cur).min(cc.cur).min(cd.cur) >= 8
+        {
+            let mut ba = ca.load_msb(pa);
+            let mut bb = cb.load_msb(pb);
+            let mut bc = cc.load_msb(pc);
+            let mut bd = cd.load_msb(pd);
+            let (mut ta, mut tb, mut tc, mut td) = (0u32, 0u32, 0u32, 0u32);
+            let wa: &mut [u8; 10] = (&mut oa[wpa..wpa + 10]).try_into().unwrap();
+            let wb: &mut [u8; 10] = (&mut ob[wpb..wpb + 10]).try_into().unwrap();
+            let wc: &mut [u8; 10] = (&mut oc[wpc..wpc + 10]).try_into().unwrap();
+            let wd: &mut [u8; 10] = (&mut od[wpd..wpd + 10]).try_into().unwrap();
+            let (mut ia, mut ib, mut ic, mut id) = (0usize, 0usize, 0usize, 0usize);
+
+            pair_step!(
+                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
+            );
+            pair_step!(
+                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
+            );
+            pair_step!(
+                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
+            );
+            pair_step!(
+                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
+            );
+            pair_step!(
+                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
+            );
+
+            wpa += ia;
+            wpb += ib;
+            wpc += ic;
+            wpd += id;
+            ca.advance(ta);
+            cb.advance(tb);
+            cc.advance(tc);
+            cd.advance(td);
+        }
+    }
+
+    let mut ra = ca.into_rev(pa);
+    let mut rb = cb.into_rev(pb);
+    let mut rc = cc.into_rev(pc);
+    let mut rd = cd.into_rev(pd);
+    finish_stream(entries, &mut ra, &mut oa[wpa..])?;
+    finish_stream(entries, &mut rb, &mut ob[wpb..])?;
+    finish_stream(entries, &mut rc, &mut oc[wpc..])?;
+    finish_stream(entries, &mut rd, &mut od[wpd..])?;
+    Ok(())
+}
+
+pub(crate) fn decode_into(
+    t: &mut HuffTable,
+    data: &[u8],
+    four: bool,
+    out: &mut [u8],
+) -> Result<()> {
+    if !four {
+        return decode_single_stream(&t.entries, data, out);
+    }
+    let (parts, seg) = stream_parts(data, out.len())?;
+    if t.pair_worth && (out.len() >= 4096 || t.pair_ready) {
+        t.ensure_pair_table();
+        return decode_4x2(&t.pair_entries, &t.entries, parts, seg, out);
+    }
+    let entries = &t.entries;
+    let (pa, pb, pc, pd) = (parts[0], parts[1], parts[2], parts[3]);
+    let (mut ca, mut cb, mut cc, mut cd) = (
+        RevCursor::new(pa)?,
+        RevCursor::new(pb)?,
+        RevCursor::new(pc)?,
+        RevCursor::new(pd)?,
+    );
+    let (oa, rest) = out.split_at_mut(seg);
+    let (ob, rest) = rest.split_at_mut(seg);
+    let (oc, od) = rest.split_at_mut(seg);
+
+    let (oa_c, _) = oa.as_chunks_mut::<5>();
+    let (ob_c, _) = ob.as_chunks_mut::<5>();
+    let (oc_c, _) = oc.as_chunks_mut::<5>();
+    let (od_c, _) = od.as_chunks_mut::<5>();
 
     let pa = &pa[..ca.cur.min(pa.len())];
     let pb = &pb[..cb.cur.min(pb.len())];
@@ -294,40 +492,57 @@ pub(crate) fn decode_into(t: &HuffTable, data: &[u8], four: bool, out: &mut [u8]
         let b3 = entries[(bb >> 53) as usize];
         let c3 = entries[(bc >> 53) as usize];
         let d3 = entries[(bd >> 53) as usize];
+        let la3 = (a3 & 15) as u32;
+        let lb3 = (b3 & 15) as u32;
+        let lc3 = (c3 & 15) as u32;
+        let ld3 = (d3 & 15) as u32;
+        ba <<= la3;
+        bb <<= lb3;
+        bc <<= lc3;
+        bd <<= ld3;
 
-        ca.advance(la0 + la1 + la2 + (a3 & 15) as u32);
-        cb.advance(lb0 + lb1 + lb2 + (b3 & 15) as u32);
-        cc.advance(lc0 + lc1 + lc2 + (c3 & 15) as u32);
-        cd.advance(ld0 + ld1 + ld2 + (d3 & 15) as u32);
+        let a4 = entries[(ba >> 53) as usize];
+        let b4 = entries[(bb >> 53) as usize];
+        let c4 = entries[(bc >> 53) as usize];
+        let d4 = entries[(bd >> 53) as usize];
+
+        ca.advance(la0 + la1 + la2 + la3 + (a4 & 15) as u32);
+        cb.advance(lb0 + lb1 + lb2 + lb3 + (b4 & 15) as u32);
+        cc.advance(lc0 + lc1 + lc2 + lc3 + (c4 & 15) as u32);
+        cd.advance(ld0 + ld1 + ld2 + ld3 + (d4 & 15) as u32);
 
         *ao = [
             (a0 >> 8) as u8,
             (a1 >> 8) as u8,
             (a2 >> 8) as u8,
             (a3 >> 8) as u8,
+            (a4 >> 8) as u8,
         ];
         *bo = [
             (b0 >> 8) as u8,
             (b1 >> 8) as u8,
             (b2 >> 8) as u8,
             (b3 >> 8) as u8,
+            (b4 >> 8) as u8,
         ];
         *co = [
             (c0 >> 8) as u8,
             (c1 >> 8) as u8,
             (c2 >> 8) as u8,
             (c3 >> 8) as u8,
+            (c4 >> 8) as u8,
         ];
         *do_ = [
             (d0 >> 8) as u8,
             (d1 >> 8) as u8,
             (d2 >> 8) as u8,
             (d3 >> 8) as u8,
+            (d4 >> 8) as u8,
         ];
         done_chunks += 1;
     }
 
-    let done_bytes = done_chunks * 4;
+    let done_bytes = done_chunks * 5;
     let mut ra = ca.into_rev(pa);
     let mut rb = cb.into_rev(pb);
     let mut rc = cc.into_rev(pc);
@@ -377,7 +592,7 @@ mod tests {
                 };
                 let used = read_tree_into(&encoded[header..], &mut table).unwrap();
                 let mut output = vec![0; n];
-                decode_into(&table, &encoded[header + used..], sf != 0, &mut output).unwrap();
+                decode_into(&mut table, &encoded[header + used..], sf != 0, &mut output).unwrap();
                 assert_eq!(output, data, "n={n} seed={seed}");
                 checked += 1;
             }

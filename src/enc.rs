@@ -1,22 +1,25 @@
 //! 自适应 Zstd 编码器：
-//! - level 1..=4：无清零代际哈希表（Fast/DoubleFast），支持三重复偏移与位代价评分
-//! - level 5..=15：浅/深哈希链 + 1/2 步前瞻
-//! - level 16..=22：二叉树后缀匹配 + 块内前向近似比特代价 DP
+//! - level 1..=4：无清零代际哈希表（Fast/DoubleFast），支持三重复偏移、自适应跳过与位代价评分
+//! - level 5..=11：SWAR 标签过滤行哈希（RowHash）+ 精确带标签 4B 近距表 + 率失真 1/2 步前瞻
+//! - level 12..=15：精确后缀二叉搜索树（BT4）+ 率失真前瞻（> 4 GiB 自动切宽索引）
+//! - level 16..=22：后缀二叉搜索树 + 1/8 bit 定点在线熵引导 L2 驻留最优解析（Optimal Parsing）
 //! - 零每块堆分配，完整支持 Raw/RLE/Compressed 块及 Predef/RLE/Custom/Repeat FSE 表。
 use crate::chain::{Chain, ChainCfg};
 use crate::dec::{LL_BASE, LL_DEFAULT, ML_BASE, ML_DEFAULT, OF_DEFAULT};
 #[cfg(test)]
 use crate::fse;
-use crate::henc::{HuffScratch, normalize_into, write_dist_into, write_literals_into};
+use crate::henc::{HuffScratch, log2_fp8, normalize_into, write_dist_into, write_literals_into};
 use crate::lz::{FastCfg, FastMode};
+use crate::opt::{OptCfg, OptParser};
 use crate::resources::Budget;
+use crate::row::{RowCfg, RowMatcher};
 
 pub(crate) const BLOCK: usize = 128 * 1024;
 
 /// 压缩参数配置（支持等级、帧末尾 XXH64 校验和、可选窗口对数上限及多线程并行）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompressOptions {
-    /// 压缩等级：`<= 0` 仅存 Raw/RLE 块，`1..=4` 快速/双哈希，`5..=15` 哈希链前瞻与二叉树，`16..=22` 启发式 DP。
+    /// 压缩等级：`<= 0` 仅存 Raw/RLE 块，`1..=4` 快速/双哈希，`5..=11` SWAR 行哈希前瞻，`12..=15` 后缀二叉树前瞻，`16..=22` 熵引导最优解析。
     pub level: i32,
     /// 是否在帧尾写入 XXH64 低 32 位内容校验和（默认开启）。
     pub checksum: bool,
@@ -145,9 +148,8 @@ const fn small_codes<const N: usize, const M: usize>(
 static LL_TAB: [u8; 64] = small_codes(&LL_BASE, 0);
 static ML_TAB: [u8; 128] = small_codes(&ML_BASE, 3);
 
-/// 返回（码，额外位数，额外值）。大值的码是 highbit 加常数，小值查表，没有循环。
 #[inline(always)]
-fn ll_code(v: u32) -> (u32, u32, u32) {
+pub(crate) fn ll_code(v: u32) -> (u32, u32, u32) {
     let c = if v < 64 {
         LL_TAB[v as usize] as u32
     } else {
@@ -158,7 +160,7 @@ fn ll_code(v: u32) -> (u32, u32, u32) {
 }
 
 #[inline(always)]
-fn ml_code(v: u32) -> (u32, u32, u32) {
+pub(crate) fn ml_code(v: u32) -> (u32, u32, u32) {
     let m = v - 3;
     let c = if m < 128 {
         ML_TAB[m as usize] as u32
@@ -299,7 +301,7 @@ impl SymTable {
 
     #[inline(always)]
     fn init_state(&self, sym: u32) -> u32 {
-        self.state_table[(self.cumul[sym as usize] as usize) & 511] as u32
+        self.state_table[(self.cumul[(sym as usize) & 63] as usize) & 511] as u32
     }
 
     #[inline(always)]
@@ -307,7 +309,7 @@ impl SymTable {
         const MASK32: [u32; 16] = [
             0, 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767,
         ];
-        let s = sym as usize;
+        let s = (sym as usize) & 63;
         let x = *state;
         let nb = (x + self.delta_nb[s]) >> 16;
         let bits = x & MASK32[(nb as usize) & 15];
@@ -391,43 +393,52 @@ fn predef_tables() -> &'static EncTables {
     TABLES.get_or_init(EncTables::new)
 }
 
-/// 估算复用 `prev` 表（`Repeat_Mode`）是否比新建 `Custom` 表更省总比特。
-fn prev_is_cheaper(cnt: &[u32], total_seqs: usize, prev: &SymTable, active_mask: u64) -> bool {
-    if !prev.valid || prev.is_rle || (active_mask & !prev.symbols) != 0 {
-        return false;
+/// MDL 准则（Rissanen 1978）选择最优 FSE 表精度：权衡表头描述长度与量化 KL 损失。
+#[inline]
+fn opt_fse_al(total_seqs: usize, active_cnt: u32, max_al: u32) -> u32 {
+    let mut al = if total_seqs < 64 {
+        5
+    } else if total_seqs < 128 {
+        6
+    } else if total_seqs < 512 {
+        7
+    } else if total_seqs < 2048 {
+        8
+    } else {
+        9
     }
-    if total_seqs < 48 {
-        return true;
+    .min(max_al);
+    while (1u32 << al) < active_cnt && al < max_al {
+        al += 1;
     }
-    let prev_size = 1usize << prev.al;
-    let mut prev_bits = 0i64;
-    let mut ideal_bits = 0i64;
-    let total_f = total_seqs.max(1) as u32;
+    al
+}
+
+/// 以 8.8 定点精确计算分布 `cnt` 在已有表 `tab` 下的交叉熵总比特（无分支近似误差 < 0.005 bit/符号）。
+#[inline]
+fn cross_entropy_fp8(cnt: &[u32], tab: &SymTable) -> u64 {
+    let al_fp8 = (tab.al << 8) as u64;
+    let mut sum = 0u64;
     for (s, &c) in cnt.iter().enumerate() {
-        if c == 0 {
-            continue;
+        if c > 0 {
+            let p = tab.probs[s].unsigned_abs().max(1) as u32;
+            sum += c as u64 * al_fp8.saturating_sub(log2_fp8(p) as u64);
         }
-        let p = prev.probs[s].abs().max(1) as u32;
-        let cost_prev = prev.al as i64 - (31 - p.leading_zeros()) as i64;
-        let cost_cur = ((31 - total_f.leading_zeros()) - (31 - c.leading_zeros())) as i64;
-        prev_bits += c as i64 * cost_prev;
-        ideal_bits += c as i64 * cost_cur;
-        let _ = prev_size;
     }
-    // 自定义分布表头通常约 12..36 字节（~100..280 比特）
-    prev_bits <= ideal_bits + 128
+    sum
 }
 
 #[allow(clippy::too_many_arguments)]
 fn select_component(
     kind: CompKind,
     cnt: &[u32],
-    al: u32,
+    max_al: u32,
     shift: u32,
     total_seqs: usize,
     pre: &SymTable,
     cur: &mut SymTable,
     prev: &SymTable,
+    fast_mode: bool,
     modes: &mut u8,
     desc: &mut Vec<u8>,
 ) -> ModeSel {
@@ -451,18 +462,57 @@ fn select_component(
         return ModeSel::Cur;
     }
 
-    // 2) 短序列且预定义表全覆盖时直接用预定义表（0 字节表头）
-    if !required && total_seqs < 48 {
+    // 2) 极短序列直接用预定义表（0 字节表头 + 零信息熵扫描）
+    if !required && total_seqs < 24 {
         return ModeSel::Predef;
     }
 
-    // 3) 若上一压缩块的同表全覆盖且估算比特更低，使用 Repeat_Mode（0 字节表头 + 零建表开销）
-    if prev_is_cheaper(cnt, total_seqs, prev, active_mask) {
-        *modes |= 3 << shift;
-        return ModeSel::Prev;
+    let eff_max_al = if fast_mode { max_al.min(7) } else { max_al };
+    let al = opt_fse_al(total_seqs, active_cnt, eff_max_al);
+
+    // 3) 以 8.8 定点交叉熵统一比较 Predef / Repeat / Custom（零表头 vs 自定义表头代价）
+    let can_predef = !required;
+    let can_prev = prev.valid && !prev.is_rle && (active_mask & !prev.symbols) == 0;
+
+    if can_predef || can_prev {
+        let log2_n = log2_fp8(total_seqs.max(1) as u32) as u64;
+        let mut ideal_fp8 = 0u64;
+        for &c in cnt {
+            if c > 0 {
+                ideal_fp8 += c as u64 * log2_n.saturating_sub(log2_fp8(c) as u64);
+            }
+        }
+        // Custom 表头估算：约 (active_cnt * (al + 2) + 32) 比特；L1 快速档放宽复用阈值免频繁建表
+        let extra_margin = if fast_mode {
+            (total_seqs as u64) << 5
+        } else {
+            0
+        };
+        let custom_est_fp8 =
+            ideal_fp8 + (((active_cnt * (al + 2) + 32) as u64) << 8) + extra_margin;
+
+        let predef_fp8 = if can_predef {
+            cross_entropy_fp8(cnt, pre)
+        } else {
+            u64::MAX
+        };
+        let prev_fp8 = if can_prev {
+            cross_entropy_fp8(cnt, prev)
+        } else {
+            u64::MAX
+        };
+
+        let best_zero_hdr = predef_fp8.min(prev_fp8);
+        if best_zero_hdr <= custom_est_fp8 {
+            if prev_fp8 < predef_fp8 {
+                *modes |= 3 << shift;
+                return ModeSel::Prev;
+            }
+            return ModeSel::Predef;
+        }
     }
 
-    // 4) 构建 Custom_Mode（复用预分配缓冲）
+    // 3) 构建 Custom_Mode（复用预分配缓冲，最小 KL 归一化 + MDL 精度）
     let mut probs_i32 = [0i32; 64];
     let n = cnt.len();
     if normalize_into(cnt, al, &mut probs_i32[..n]).is_some() {
@@ -480,13 +530,58 @@ fn select_component(
         desc.truncate(mark);
     }
 
-    // 若极罕见情况下 Custom 构建失败且必须替代预定义表，保底 Predef（仅在无超标符号时有效）
+    // 保底回退
     let _ = kind;
     ModeSel::Predef
 }
 
+#[cold]
 #[inline(never)]
-fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut Vec<u8>) {
+#[allow(clippy::too_many_arguments)]
+fn flush_long_seq(
+    buf: &mut [u8],
+    wp: &mut usize,
+    acc: &mut u64,
+    nbits: &mut u32,
+    fse: u64,
+    fse_nb: u32,
+    extra: u64,
+    eb: u32,
+) {
+    macro_rules! flush_one {
+        () => {{
+            buf[*wp..*wp + 8].copy_from_slice(&acc.to_le_bytes());
+            let bytes = ((*nbits >> 3) & 7) as usize;
+            *wp += bytes;
+            *acc >>= bytes << 3;
+            *nbits &= 7;
+        }};
+    }
+    *acc |= fse << *nbits;
+    *nbits += fse_nb;
+    flush_one!();
+    if eb <= 56 {
+        *acc |= extra << *nbits;
+        *nbits += eb;
+        flush_one!();
+    } else {
+        *acc |= (extra & 0xFFFF_FFFF) << *nbits;
+        *nbits += 32;
+        flush_one!();
+        *acc |= (extra >> 32) << *nbits;
+        *nbits += eb - 32;
+        flush_one!();
+    }
+}
+
+#[inline(never)]
+fn write_seqs_into(
+    seqs: &[Seq],
+    pre: &EncTables,
+    sc: &mut SeqScratch,
+    fast_mode: bool,
+    out: &mut Vec<u8>,
+) {
     const OC_MASK: [u32; 32] = [
         0,
         1,
@@ -521,13 +616,14 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
         0x3FFF_FFFF,
         0x7FFF_FFFF,
     ];
-    let mut cl = [0u32; 36];
+    let mut cl = [0u32; 64];
     let mut co = [0u32; 32];
-    let mut cm = [0u32; 53];
+    let mut cm = [0u32; 64];
     let n = seqs.len();
-    sc.encoded.clear();
-    sc.encoded.reserve(n);
-    for s in seqs {
+    if sc.encoded.len() < n {
+        sc.encoded.resize(n, SeqBits::default());
+    }
+    for (dst, s) in sc.encoded[..n].iter_mut().zip(seqs) {
         let (lc, lb, lv) = ll_code(s.ll);
         let (mc, mb, mv) = ml_code(s.ml);
         let ofv = if s.rep_code != 0 {
@@ -537,21 +633,19 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
         };
         let oc = 31 - ofv.leading_zeros();
         let ov = ofv & OC_MASK[(oc as usize) & 31];
-        cl[lc as usize] += 1;
-        co[oc as usize] += 1;
-        cm[mc as usize] += 1;
+        cl[(lc as usize) & 63] += 1;
+        co[(oc as usize) & 31] += 1;
+        cm[(mc as usize) & 63] += 1;
         let extra = (lv as u64) | ((mv as u64) << lb) | ((ov as u64) << (lb + mb));
-        sc.encoded.push(SeqBits {
+        *dst = SeqBits {
             extra,
             lc: lc as u8,
             oc: oc as u8,
             mc: mc as u8,
             eb: (lb + mb + oc) as u8,
-        });
+        };
     }
 
-    let ll_al = if n < 512 { 8 } else { 9 };
-    let ml_al = if n < 512 { 8 } else { 9 };
     let mut modes = 0u8;
     sc.desc.clear();
     let prev_ll = if sc.prev_is_predef[0] {
@@ -571,13 +665,14 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
     };
     let sel_ll = select_component(
         CompKind::Ll,
-        &cl,
-        ll_al,
+        &cl[..36],
+        9,
         6,
         n,
         &pre.ll,
         &mut sc.cur[0],
         prev_ll,
+        fast_mode,
         &mut modes,
         &mut sc.desc,
     );
@@ -590,18 +685,20 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
         &pre.of,
         &mut sc.cur[1],
         prev_of,
+        fast_mode,
         &mut modes,
         &mut sc.desc,
     );
     let sel_ml = select_component(
         CompKind::Ml,
-        &cm,
-        ml_al,
+        &cm[..53],
+        9,
         2,
         n,
         &pre.ml,
         &mut sc.cur[2],
         prev_ml,
+        fast_mode,
         &mut modes,
         &mut sc.desc,
     );
@@ -625,7 +722,7 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
     out.push(modes);
     out.extend_from_slice(&sc.desc);
 
-    let need = n * 12 + 40;
+    let need = n * 12 + 48;
     if sc.seq_buf.len() < need {
         sc.seq_buf.resize(need, 0);
     }
@@ -664,7 +761,7 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
     }
 
     for &sb in sc.encoded[..n - 1].iter().rev() {
-        if wp + 24 > buf.len() {
+        if wp + 32 > buf.len() {
             break;
         }
         let (n1, v1) = to.step_state(sb.oc as u32, &mut sto);
@@ -679,21 +776,9 @@ fn write_seqs_into(seqs: &[Seq], pre: &EncTables, sc: &mut SeqScratch, out: &mut
             nbits += fse_nb + eb;
             flush64!();
         } else {
-            acc |= fse << nbits;
-            nbits += fse_nb;
-            flush64!();
-            if eb <= 56 {
-                acc |= sb.extra << nbits;
-                nbits += eb;
-                flush64!();
-            } else {
-                acc |= (sb.extra & 0xFFFF_FFFF) << nbits;
-                nbits += 32;
-                flush64!();
-                acc |= (sb.extra >> 32) << nbits;
-                nbits += eb - 32;
-                flush64!();
-            }
+            flush_long_seq(
+                buf, &mut wp, &mut acc, &mut nbits, fse, fse_nb, sb.extra, eb,
+            );
         }
     }
 
@@ -794,6 +879,10 @@ fn encode_window_descriptor(window_log: u32) -> u8 {
 /// 单线程 Zstd 编码内核状态（可由 [`Compressor`] 复用，或由多线程池按核持有）。
 pub(crate) struct EncCore {
     fast: Option<(FastMode, bool, bool)>, // (mode, tagged, wide)
+    row: Option<RowMatcher>,
+    row_idle: u8,
+    opt: Option<OptParser>,
+    opt_idle: u8,
     chain: Option<Chain<u32>>,
     wide_chain: Option<Chain<usize>>,
     chain_idle: u8,
@@ -808,6 +897,10 @@ impl EncCore {
     pub(crate) fn new() -> Self {
         Self {
             fast: None,
+            row: None,
+            row_idle: 0,
+            opt: None,
+            opt_idle: 0,
             chain: None,
             wide_chain: None,
             chain_idle: 0,
@@ -821,6 +914,10 @@ impl EncCore {
 
     pub(crate) fn shrink_to_fit(&mut self) {
         self.fast = None;
+        self.row = None;
+        self.row_idle = 0;
+        self.opt = None;
+        self.opt_idle = 0;
         self.chain = None;
         self.wide_chain = None;
         self.chain_idle = 0;
@@ -948,7 +1045,12 @@ impl EncCore {
         }
 
         let mut use_fast = false;
+        let mut row_cfg = None;
+        let mut opt_cfg = None;
         let mut fast_cfg = FastCfg::for_level(level);
+        if level == 3 && (data.len() > BLOCK || data.len() < 128) {
+            fast_cfg.min_match = 5;
+        }
         let mut chain_cfg = None;
         if let Some(ref b) = budget {
             if level < 5 {
@@ -961,7 +1063,28 @@ impl EncCore {
                         self.chain_idle = 0;
                     }
                 }
-                let active_bits = b.hash_bits.max(1);
+                if self.row.is_some() {
+                    self.row_idle = self.row_idle.saturating_add(1);
+                    if self.row_idle >= 8 {
+                        self.row = None;
+                        self.row_idle = 0;
+                    }
+                }
+                if self.opt.is_some() {
+                    self.opt_idle = self.opt_idle.saturating_add(1);
+                    if self.opt_idle >= 8 {
+                        self.opt = None;
+                        self.opt_idle = 0;
+                    }
+                }
+                let active_bits = match level {
+                    ..=1 => b.hash_bits.clamp(1, 15),
+                    3 if data.len() > BLOCK => {
+                        16u32.min(usize::BITS - 1 - data.len().leading_zeros())
+                    }
+                    _ => b.hash_bits.max(1),
+                };
+                let fast_win = win_limit;
                 let reuse_ok = self
                     .fast
                     .as_ref()
@@ -974,10 +1097,66 @@ impl EncCore {
                     ));
                 }
                 if let Some((ref mut f, _, _)) = self.fast {
-                    f.prepare(data.len(), active_bits, fast_cfg.dual, win_limit);
+                    f.prepare(data.len(), active_bits, fast_cfg.dual, fast_win);
                 }
+            } else if level <= 11 && !wide {
+                self.row_idle = 0;
+                if self.chain.is_some() || self.wide_chain.is_some() {
+                    self.chain_idle = self.chain_idle.saturating_add(1);
+                    if self.chain_idle >= 8 {
+                        self.chain = None;
+                        self.wide_chain = None;
+                        self.chain_idle = 0;
+                    }
+                }
+                if self.opt.is_some() {
+                    self.opt_idle = self.opt_idle.saturating_add(1);
+                    if self.opt_idle >= 8 {
+                        self.opt = None;
+                        self.opt_idle = 0;
+                    }
+                }
+                let rc = RowCfg::for_level(level, data.len(), win_limit);
+                let rm = self.row.get_or_insert_with(RowMatcher::new);
+                rm.prepare(data.len(), rc);
+                row_cfg = Some(rc);
+            } else if level >= 16 && !wide {
+                self.opt_idle = 0;
+                if self.row.is_some() {
+                    self.row_idle = self.row_idle.saturating_add(1);
+                    if self.row_idle >= 8 {
+                        self.row = None;
+                        self.row_idle = 0;
+                    }
+                }
+                if self.chain.is_some() || self.wide_chain.is_some() {
+                    self.chain_idle = self.chain_idle.saturating_add(1);
+                    if self.chain_idle >= 8 {
+                        self.chain = None;
+                        self.wide_chain = None;
+                        self.chain_idle = 0;
+                    }
+                }
+                let oc = OptCfg::for_level(level, data.len(), b.window, win_limit);
+                let op = self.opt.get_or_insert_with(OptParser::new);
+                op.prepare(data.len(), oc);
+                opt_cfg = Some(oc);
             } else {
                 self.chain_idle = 0;
+                if self.row.is_some() {
+                    self.row_idle = self.row_idle.saturating_add(1);
+                    if self.row_idle >= 8 {
+                        self.row = None;
+                        self.row_idle = 0;
+                    }
+                }
+                if self.opt.is_some() {
+                    self.opt_idle = self.opt_idle.saturating_add(1);
+                    if self.opt_idle >= 8 {
+                        self.opt = None;
+                        self.opt_idle = 0;
+                    }
+                }
                 let cc = ChainCfg::from_budget(b, level, win_limit);
                 chain_cfg = Some(cc);
                 if wide {
@@ -1039,6 +1218,24 @@ impl EncCore {
                     &mut self.seqs,
                     &mut self.lits,
                 )
+            } else if let Some(rc) = row_cfg {
+                self.row.as_mut().expect("row init").parse(
+                    data,
+                    (start, end),
+                    rc,
+                    &mut rep,
+                    &mut self.seqs,
+                    &mut self.lits,
+                )
+            } else if let Some(oc) = opt_cfg {
+                self.opt.as_mut().expect("opt init").parse(
+                    data,
+                    (start, end),
+                    oc,
+                    &mut rep,
+                    &mut self.seqs,
+                    &mut self.lits,
+                )
             } else if let Some(cc) = chain_cfg {
                 if wide {
                     self.wide_chain.as_mut().expect("wide chain init").parse(
@@ -1086,6 +1283,7 @@ impl EncCore {
                     &self.seqs,
                     pre.expect("positive level"),
                     &mut self.seq_sc,
+                    level <= 1,
                     &mut self.body,
                 );
                 Some(self.body[seq_hdr_pos])
@@ -1161,7 +1359,7 @@ mod tests {
                 rep_code: 0,
             }];
             let mut body = Vec::new();
-            write_seqs_into(&seqs, pre, &mut sc, &mut body);
+            write_seqs_into(&seqs, pre, &mut sc, false, &mut body);
             assert_eq!((body[0] >> 4) & 3, 1);
             assert_eq!(body[1], 0);
             assert_eq!(body[2], 31 - ((1u32 << 29) + 3).leading_zeros() as u8);
@@ -1183,7 +1381,7 @@ mod tests {
             },
         ];
         let mut body = Vec::new();
-        write_seqs_into(&seqs, pre, &mut sc, &mut body);
+        write_seqs_into(&seqs, pre, &mut sc, false, &mut body);
         assert_eq!((body[0] >> 4) & 3, 2);
         let (decoded, _used) = fse::read_table(&sc.desc[1..], 31, 8).unwrap();
         let sym1 = 31 - ((1u32 << 29) + 3).leading_zeros();

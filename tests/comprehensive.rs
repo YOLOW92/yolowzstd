@@ -545,3 +545,357 @@ fn fcs_window_descriptor_and_parallel_budget_regressions() {
     assert_eq!(err_out, b"qqqqq");
     assert!(err_out.len() <= 10);
 }
+
+fn verify_with_zstd_cli(z: &[u8], expected: &[u8], label: &str) {
+    if Command::new("zstd").arg("--version").output().is_err() {
+        return;
+    }
+    let mut child = Command::new("zstd")
+        .args(["-d", "-c", "-q"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(z).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "zstd -d rejected {label}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, expected, "zstd -d mismatch on {label}");
+}
+
+#[test]
+fn adversarial_huffman_fse_weights_uniform_and_skewed() {
+    // 构造字面量分布，使 Huffman 权重表 shown 出现：
+    // 1) 全相等权重（active == 1，例如 12 个符号各 10 次 + 1 个符号 40 次 -> shown = [1; 12]）
+    // 2) 全相等权重且 > 128 个（192 个符号各 10 次 + 符号 192 出现 640 次 -> shown = [1; 192]）
+    // 3) 仅 1 个 0 + 192 个 1（probs = [1/-1, 63]，存在大量 nb == 0 状态！）
+    let shuffle = |mut v: Vec<u8>, mut s: u64| -> Vec<u8> {
+        for i in (1..v.len()).rev() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = ((s >> 32) as usize) % (i + 1);
+            v.swap(i, j);
+        }
+        v
+    };
+
+    // Case 1: 12 symbols (0..12) x 40 + sym 12 x 160 = 640 bytes (shown = [1; 12], active == 1)
+    let mut case1 = Vec::new();
+    for s in 0..12u8 {
+        case1.extend(std::iter::repeat_n(s, 40));
+    }
+    case1.extend(std::iter::repeat_n(12u8, 160));
+    let case1 = shuffle(case1, 101);
+
+    // Case 2: 192 symbols (0..192) x 10 + sym 192 x 640 = 2560 bytes (shown = [1; 192], active == 1)
+    let mut case2 = Vec::new();
+    for s in 0..192u8 {
+        case2.extend(std::iter::repeat_n(s, 10));
+    }
+    case2.extend(std::iter::repeat_n(192u8, 640));
+    let case2 = shuffle(case2, 202);
+
+    // Case 3: 192 symbols (1..=192) x 10 + sym 193 x 640 -> weight[0] = 0, weight[1..=192] = 1 (probs ~ [-1/1, 63])
+    let mut case3 = Vec::new();
+    for s in 1..=192u8 {
+        case3.extend(std::iter::repeat_n(s, 10));
+    }
+    case3.extend(std::iter::repeat_n(193u8, 640));
+    let case3 = shuffle(case3, 303);
+
+    // Case 4: weight[0..192] = 1, weight[192] = 0, weight[193] = 7 (0 at end of shown!)
+    let mut case4 = Vec::new();
+    for s in 0..192u8 {
+        case4.extend(std::iter::repeat_n(s, 10));
+    }
+    case4.extend(std::iter::repeat_n(193u8, 640));
+    let case4 = shuffle(case4, 404);
+
+    // Case 5: 192 symbols with 1 zero at index 190 (so w[n-2] == 0, w[n-1] == 1) and vice versa
+    let mut case5 = Vec::new();
+    for s in 0..193u8 {
+        if s != 191 {
+            case5.extend(std::iter::repeat_n(s, 10));
+        }
+    }
+    case5.extend(std::iter::repeat_n(193u8, 640));
+    let case5 = shuffle(case5, 505);
+
+    let mut failures = Vec::new();
+    for (name, data) in [
+        ("case1_12_uniform", &case1),
+        ("case2_192_uniform", &case2),
+        ("case3_1zero_192ones", &case3),
+        ("case4_192ones_1zero", &case4),
+        ("case5_zero_at_n_minus_2", &case5),
+    ] {
+        for &lvl in &[1, 3, 9, 19] {
+            let z = compress(data, lvl);
+            match decompress(&z, data.len()) {
+                Ok(dec) if dec == *data => {
+                    verify_with_zstd_cli(&z, data, &format!("{name} L{lvl}"));
+                }
+                Ok(_) => failures.push(format!("{name} L{lvl}: data mismatch")),
+                Err(e) => failures.push(format!("{name} L{lvl}: decompress err {e:?}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failures:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn adversarial_tiny_window_all_levels_and_zstd_interop() {
+    // 构造在精确偏移 1022/1023/1024/1025/2048 处重复的数据，测试 window_log(10) 与 window_log(11) 全档位
+    let mut data = Vec::with_capacity(20_000);
+    let mut s = 0x55AA_1234_9876_FEDC_u64;
+    for _ in 0..20_000 {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        data.push((s >> 48) as u8);
+    }
+    for &off in &[1022usize, 1023, 1024, 1025, 2047, 2048, 2049] {
+        let pos = off * 3;
+        if pos + 200 < data.len() {
+            data.copy_within(pos - off..pos - off + 200, pos);
+        }
+    }
+    // 叠加长共享前缀（> 512B）
+    let long_pat = b"LONG_SHARED_PREFIX_TEST_BLOCK_0123456789_ABCDEF_".repeat(15); // 720 bytes
+    for p in (2500..18000).step_by(1024) {
+        if p + long_pat.len() + 4 < data.len() {
+            data[p..p + long_pat.len()].copy_from_slice(&long_pat);
+            data[p + long_pat.len()] = (p / 1024) as u8;
+        }
+    }
+
+    for wlog in [10u32, 11] {
+        for lvl in 0..=22 {
+            let opts = CompressOptions::new(lvl).with_window_log(Some(wlog));
+            let z = compress_with(&data, &opts);
+            let dec = decompress(&z, data.len())
+                .unwrap_or_else(|e| panic!("decompress failed wlog={wlog} L{lvl}: {e:?}"));
+            assert_eq!(dec, data, "mismatch wlog={wlog} L{lvl}");
+            if matches!(lvl, 1 | 3 | 5 | 9 | 12 | 16 | 19 | 22) {
+                verify_with_zstd_cli(&z, &data, &format!("wlog={wlog} L{lvl}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn adversarial_opt_chunk_overflow_litlen_and_long_prefixes() {
+    // 1) 超过 65536 字节连续不可压缩字面量 + 末尾可压缩段（测试 OptParser init_ll / litlen u16 截断）
+    let mut big_lit = Vec::with_capacity(90_000);
+    let mut s = 0xDEAD_BEEF_CAFE_BABEu64;
+    for _ in 0..72_000 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        big_lit.push((s >> 32) as u8);
+    }
+    big_lit.extend_from_slice(&b"match_after_72k_literals_0123456789\n".repeat(400));
+
+    // 2) 密集短匹配无超长匹配，强制 OptParser 跨越 OPT_CHUNK=4096 切分
+    let mut dense = Vec::with_capacity(20_000);
+    let mut rng = 0x1122_3344_5566_7788u64;
+    for i in 0..2500 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let tok = (rng >> 56) % 16;
+        dense.extend_from_slice(&format!("t{tok:02x}_").into_bytes());
+        dense.push(b'a' + (i % 26) as u8);
+        dense.push(b'0' + ((rng >> 48) % 10) as u8);
+    }
+
+    // 3) 跨 128 KiB 块边界的超长前缀 (> 600B) 且直达 EOF 的精确重复
+    let mut eof_rep = Vec::with_capacity(140_000);
+    let stem = b"ZSTD_OPT_BST_SPLICING_STRESS_TEST_STEM_".repeat(18); // 702 bytes
+    for i in 0..195u32 {
+        eof_rep.extend_from_slice(&stem);
+        eof_rep.push((i & 0xFF) as u8);
+        eof_rep.push(((i * 7) & 0xFF) as u8);
+    }
+    eof_rep.extend_from_slice(&stem); // ends right at EOF with 702B match
+
+    for (name, data) in [
+        ("big_lit_72k", &big_lit),
+        ("dense_opt_chunk", &dense),
+        ("eof_long_prefix", &eof_rep),
+    ] {
+        for &lvl in &[12, 16, 19, 22] {
+            let z = compress(data, lvl);
+            let dec = decompress(&z, data.len()).unwrap();
+            assert_eq!(dec, *data, "{name} L{lvl}");
+            verify_with_zstd_cli(&z, data, &format!("{name} L{lvl}"));
+        }
+    }
+}
+
+#[test]
+fn adversarial_skewed_fse_minus_one_and_compressor_reuse() {
+    // 构造极偏斜序列分布（大量重复 ml=4 + 48 种长匹配各出现 1 次），迫使 FSE 产生大量 -1 极低概率符号
+    let mut skewed_seqs = Vec::new();
+    let seed_chunk = b"ABCD____EFGH____IJKL____MNOP____";
+    skewed_seqs.extend_from_slice(seed_chunk);
+    // 生成大量长度为 4 的匹配
+    for i in 0..6000u32 {
+        skewed_seqs.extend_from_slice(b"ABCD");
+        skewed_seqs.push((i % 251) as u8);
+    }
+    // 插入 48 种不同长度的匹配（5..=500），触发极偏斜 ML 符号分布
+    let big_pat: Vec<u8> = (0..600).map(|i| ((i * 73 + 19) % 251) as u8).collect();
+    skewed_seqs.extend_from_slice(&big_pat);
+    for k in 0..48usize {
+        let len = 5 + k * 10;
+        skewed_seqs.push(252 + (k % 3) as u8);
+        skewed_seqs.extend_from_slice(&big_pat[..len]);
+    }
+    // 第二块复用/切换，测试 Repeat vs Custom
+    skewed_seqs.extend_from_slice(&skewed_seqs.clone());
+
+    for &lvl in &[1, 3, 5, 9, 12, 16, 19, 22] {
+        let z = compress(&skewed_seqs, lvl);
+        let dec = decompress(&z, skewed_seqs.len()).unwrap();
+        assert_eq!(dec, skewed_seqs, "skewed_seqs L{lvl}");
+        verify_with_zstd_cli(&z, &skewed_seqs, &format!("skewed_seqs L{lvl}"));
+    }
+
+    // 单个 Compressor 在大小帧、全档位间剧烈切换复用
+    let mut comp = Compressor::new();
+    let mut dec = Decompressor::new();
+    let sizes = [
+        200_000usize,
+        0,
+        1,
+        3,
+        4,
+        7,
+        8,
+        63,
+        64,
+        65,
+        65535,
+        65536,
+        65537,
+        131_072,
+        12,
+        100_000,
+        9,
+    ];
+    for (idx, &sz) in sizes.iter().enumerate() {
+        let payload = if idx % 2 == 0 {
+            structured_payload(sz)
+        } else {
+            lcg(sz, idx as u64 + 17)
+        };
+        for &lvl in &[1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 15, 16, 19, 22] {
+            let z = comp.compress(&payload, lvl);
+            let out = dec.decompress(&z, sz.max(1)).unwrap();
+            assert_eq!(out, payload, "reuse sz={sz} lvl={lvl}");
+        }
+    }
+}
+
+#[test]
+fn adversarial_huff_pair_table_repeat_and_mutation_safety() {
+    // Block 1: 高偏斜 >= 10 KiB 字面量触发 pair_worth + pair_ready=true
+    // Block 2..N: 使用 Repeat 树且字面量段很小（40..4100B），测试 decode_4x2 在小段上的所有边界
+    let make_skewed = |n: usize, seed: u64| -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let x = (s >> 48) as usize % 100;
+                if x < 55 {
+                    b'e'
+                } else if x < 80 {
+                    b't'
+                } else if x < 92 {
+                    b'a'
+                } else {
+                    b'0' + (x % 8) as u8
+                }
+            })
+            .collect()
+    };
+    let mut stream = make_skewed(128 * 1024, 1);
+    for &tail_sz in &[40usize, 41, 42, 43, 44, 45, 256, 257, 300, 4095, 4096, 4097] {
+        let mut d = stream.clone();
+        d.extend_from_slice(&make_skewed(tail_sz, tail_sz as u64 + 7));
+        let z = compress(&d, 1);
+        assert_eq!(decompress(&z, d.len()).unwrap(), d, "tail_sz={tail_sz}");
+        verify_with_zstd_cli(&z, &d, &format!("huff_pair tail_sz={tail_sz}"));
+    }
+    // 变异命中 decode_4x2 的压缩帧不应 panic
+    let z = compress(&stream, 3);
+    let mut rng = 0xABCD_1234_5678_90EFu64;
+    let mut dec = Decompressor::new();
+    let mut out = Vec::new();
+    for _ in 0..1500 {
+        let mut m = z.clone();
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let flips = 1 + ((rng >> 56) as usize % 3);
+        for _ in 0..flips {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let idx = (rng as usize) % m.len();
+            m[idx] ^= ((rng >> 40) as u8).max(1);
+        }
+        out.clear();
+        let _ = dec.decompress_into(&m, &mut out, stream.len() + 4096);
+    }
+    stream.clear();
+}
+
+#[test]
+fn adversarial_fibonacci_huff_depth_and_many_3byte_sequences() {
+    // 1) 斐波那契频次（深度 > 11）触发 O(n) Kraft 截断，并经官方 zstd -d 互操作校验
+    let mut fib_data = Vec::new();
+    let (mut a, mut b) = (1usize, 1usize);
+    for s in 0..22u8 {
+        fib_data.extend(std::iter::repeat_n(s, a));
+        let next = a + b;
+        a = b;
+        b = next;
+    }
+    let mut rng = 0x7788_99AA_BBCC_DDEEu64;
+    for i in (1..fib_data.len()).rev() {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = ((rng >> 32) as usize) % (i + 1);
+        fib_data.swap(i, j);
+    }
+    for &lvl in &[1, 3, 9, 19] {
+        let z = compress(&fib_data, lvl);
+        assert_eq!(decompress(&z, fib_data.len()).unwrap(), fib_data);
+        verify_with_zstd_cli(&z, &fib_data, &format!("fibonacci L{lvl}"));
+    }
+
+    // 2) 单块超过 32512 (0x7F00) 条 3B 匹配序列（触发 3 字节序列数编码与 3B rep/Hash3）
+    let mut many_seqs = Vec::with_capacity(131_072);
+    let dict: [[u8; 3]; 16] = [
+        *b"a0!", *b"b1@", *b"c2#", *b"d3$", *b"e4%", *b"f5^", *b"g6&", *b"h7*", *b"i8(", *b"j9)",
+        *b"kA-", *b"lB=", *b"mC+", *b"nD[", *b"oE]", *b"pF;",
+    ];
+    for t in &dict {
+        many_seqs.extend_from_slice(t);
+    }
+    let mut s = 0x1357_9BDF_2468_ACE0u64;
+    while many_seqs.len() + 3 <= 131_072 {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let idx = ((s >> 56) as usize) & 15;
+        many_seqs.extend_from_slice(&dict[idx]);
+    }
+    for &lvl in &[5, 9, 16, 19] {
+        let z = compress(&many_seqs, lvl);
+        assert_eq!(decompress(&z, many_seqs.len()).unwrap(), many_seqs);
+        verify_with_zstd_cli(&z, &many_seqs, &format!("many_3byte_seqs L{lvl}"));
+    }
+}
