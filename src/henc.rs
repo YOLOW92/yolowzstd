@@ -1,50 +1,7 @@
-//! Huffman 字面量编码：O(n) Kraft 截断限长码、香农熵/KL 散度早退、打包表 5 符号批编码、KL 最优 FSE 归一化。
+//! Huffman 字面量编码：O(n) Kraft 截断限长码、香农熵/KL 散度早退、打包表 5 符号批编码。
 use crate::enc::BitAcc;
+use crate::entropy::{log2_fp8, normalize_into, write_dist_into};
 use crate::fse;
-
-/// 8.8 定点 log2(1 + i/256) 查表，精度 < 0.005 bit，用于无浮点信息熵与交叉熵计算。
-const LOG2_FRAC: [u16; 256] = {
-    // 使用多项式展开 ln(1+u)/ln(2) ≈ u*(1.442695 - u*(0.721348 - u*(0.480898 - u*0.360674)))
-    // 在 const 中通过纯定点整数算术精确计算到 8.8 定点（256 = 1.0 bit）。
-    let mut tab = [0u16; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        // 令 x = 256 + i，以 Q28 缩放（最大 < 2^29，平方 < 2^58 不溢出 u64）迭代求 8 位定点小数
-        let mut v = ((256 + i) as u64) << 20; // Q28，范围 [1.0, 2.0)
-        let mut frac = 0u32;
-        let mut bit = 128u32;
-        while bit > 0 {
-            v = (v * v) >> 28;
-            if v >= (2u64 << 28) {
-                v >>= 1;
-                frac |= bit;
-            }
-            bit >>= 1;
-        }
-        v = (v * v) >> 28;
-        if v >= (2u64 << 28) {
-            frac += 1;
-        }
-        tab[i] = frac as u16;
-        i += 1;
-    }
-    tab
-};
-
-/// 返回 8.8 定点 `log2(x)`（`x >= 1`；`256` 表示 `1.0 bit`）。
-#[inline(always)]
-pub(crate) fn log2_fp8(x: u32) -> u32 {
-    if x <= 1 {
-        return 0;
-    }
-    let k = 31 - x.leading_zeros();
-    let frac = if k >= 8 {
-        ((x >> (k - 8)) & 255) as usize
-    } else {
-        ((x << (8 - k)) & 255) as usize
-    };
-    (k << 8) + LOG2_FRAC[frac] as u32
-}
 
 /// 跨块复用的 Huffman 编码暂存与上块激活树（支持无头复用类型 3）。
 pub(crate) struct HuffScratch {
@@ -176,7 +133,6 @@ fn lengths_into(freq: &[u32; 256], max_len: u8, out: &mut [u8; 256]) -> (u8, usi
     }
     let mut maxlen = *depth[..n].iter().max().unwrap_or(&0);
     if maxlen > max_len {
-        // 阶段 1：截断超长码至 max_len 并统计 Kraft 溢出量 Δ = Σ 2^(max_len - d_k) - 2^max_len。
         let target = 1i32 << max_len;
         let mut kraft = 0i32;
         for d in &mut depth[..n] {
@@ -185,7 +141,6 @@ fn lengths_into(freq: &[u32; 256], max_len: u8, out: &mut [u8; 256]) -> (u8, usi
             }
             kraft += 1i32 << (max_len - *d);
         }
-        // 低频符号优先加长 1 位以最小化频率加权比特代价 Σ f_k Δd_k。
         while kraft > target {
             for d in &mut depth[..n] {
                 if *d < max_len {
@@ -197,7 +152,6 @@ fn lengths_into(freq: &[u32; 256], max_len: u8, out: &mut [u8; 256]) -> (u8, usi
                 }
             }
         }
-        // 阶段 2：若产生盈余（kraft < target），高频符号优先缩短 1 位精确回收 Kraft 预算至等号成立。
         while kraft < target {
             for d in depth[..n].iter_mut().rev() {
                 if *d > 1 {
@@ -221,165 +175,7 @@ fn lengths_into(freq: &[u32; 256], max_len: u8, out: &mut [u8; 256]) -> (u8, usi
     (maxlen, lastsym)
 }
 
-/// 凸最优最小 KL 散度 FSE 概率归一化（Gross 1956 / Duda 2013 / RFC 8878 `-1` 极低频符号支持）：
-/// 在 `Σ |p_i| = 2^al` 约束下最小化交叉熵 `-Σ c_i log2(|p_i| / 2^al)`。
-pub(crate) fn normalize_into(cnt: &[u32], al: u32, probs: &mut [i32]) -> Option<()> {
-    let len = cnt.len();
-    let size = 1i64 << al;
-    let mut n = 0u64;
-    let mut active = 0i64;
-    for &c in cnt {
-        if c > 0 {
-            n += c as u64;
-            active += 1;
-        }
-    }
-    if n == 0 || active > size || probs.len() < len {
-        return None;
-    }
-    let probs = &mut probs[..len];
-    probs.fill(0);
-    if active == size {
-        for i in 0..len {
-            if cnt[i] > 0 {
-                probs[i] = 1;
-            }
-        }
-        return Some(());
-    }
-    let mut used = 0i64;
-    let size_u = size as u64;
-    for i in 0..len {
-        let c = cnt[i];
-        if c > 0 {
-            // 真实概率显著低于 0.5 格时使用 RFC 8878 的 `-1`（占 1 格且分布表头编码值 0 更省位）。
-            if (c as u64) * size_u * 2 < n {
-                probs[i] = -1;
-                used += 1;
-            } else {
-                let p = ((c as u64 * size_u) / n).max(1) as i32;
-                probs[i] = p;
-                used += p as i64;
-            }
-        }
-    }
-    if used < size {
-        // 凸离散资源分配（边际 KL 收益 c_i / (p_i + 0.5) 最大者优先 +1，纯整数交叉乘法无浮点无除法）。
-        let mut rem = size - used;
-        while rem > 0 {
-            let mut best = usize::MAX;
-            let mut best_c = 0u64;
-            let mut best_denom = 1u64;
-            for i in 0..len {
-                let p = probs[i];
-                if p > 0 {
-                    let c = cnt[i] as u64;
-                    let denom = (p as u64) * 2 + 1;
-                    if best == usize::MAX || c * best_denom > best_c * denom {
-                        best = i;
-                        best_c = c;
-                        best_denom = denom;
-                    }
-                }
-            }
-            if best == usize::MAX {
-                // 极端情形全部落入 -1：提升计数最大的符号为 +1
-                let mut big = 0usize;
-                for i in 1..len {
-                    if cnt[i] > cnt[big] {
-                        big = i;
-                    }
-                }
-                probs[big] = 1;
-                continue;
-            }
-            probs[best] += 1;
-            rem -= 1;
-        }
-    } else if used > size {
-        // 边际 KL 损失 c_i / (p_i - 0.5) 最小者优先 -1。
-        let mut excess = used - size;
-        while excess > 0 {
-            let mut best = usize::MAX;
-            let mut best_c = 0u64;
-            let mut best_denom = 1u64;
-            for i in 0..len {
-                let p = probs[i];
-                if p >= 2 {
-                    let c = cnt[i] as u64;
-                    let denom = (p as u64) * 2 - 1;
-                    if best == usize::MAX || c * best_denom < best_c * denom {
-                        best = i;
-                        best_c = c;
-                        best_denom = denom;
-                    }
-                }
-            }
-            if best == usize::MAX {
-                return None;
-            }
-            probs[best] -= 1;
-            excess -= 1;
-        }
-    }
-    Some(())
-}
-
-/// 保留旧接口供测试与零碎调用使用。
-#[cfg(test)]
-pub(crate) fn normalize(cnt: &[u32], al: u32) -> Option<Vec<i32>> {
-    let mut probs = vec![0i32; cnt.len()];
-    normalize_into(cnt, al, &mut probs)?;
-    Some(probs)
-}
-
-/// 写 FSE 分布表头（支持 `-1` 低概率符号；到最后一个非零符号为止），直接写入 `out`。
-pub(crate) fn write_dist_into(probs: &[i32], al: u32, out: &mut Vec<u8>) -> Option<()> {
-    let last = probs.iter().rposition(|&p| p != 0)?;
-    let mut bw = BitAcc::new();
-    bw.put(out, al - 5, 4);
-    let (mut remaining, mut thr, mut nbits) = ((1i32 << al) + 1, 1i32 << al, al + 1);
-    let mut s = 0usize;
-    while remaining > 1 && s <= last {
-        let p = probs[s];
-        let x = p + 1;
-        let max = 2 * thr - 1 - remaining;
-        if x < max {
-            bw.put(out, x as u32, nbits - 1);
-        } else if x >= thr {
-            bw.put(out, (x + max) as u32, nbits);
-        } else {
-            bw.put(out, x as u32, nbits);
-        }
-        remaining -= p.abs();
-        if p == 0 {
-            let mut z = 1;
-            while s + z <= last && probs[s + z] == 0 {
-                z += 1;
-            }
-            let mut r = z - 1;
-            while r >= 3 {
-                bw.put(out, 3, 2);
-                r -= 3;
-            }
-            bw.put(out, r as u32, 2);
-            s += z;
-        } else {
-            s += 1;
-        }
-        while remaining < thr {
-            nbits -= 1;
-            thr >>= 1;
-        }
-    }
-    if remaining != 1 {
-        return None;
-    }
-    bw.flush_bytes(out);
-    Some(())
-}
-
-/// 把权重表写成 FSE 压缩形式（带 1 字节总长前缀）直接追加到 `out`；不满足压缩条件时返回 None（不污染 `out`）。
+/// 把权重表写成 FSE 压缩形式（带 1 字节总长前缀）直接追加到 `out`；不满足压缩条件时返回 false（不污染 `out`）。
 fn try_write_fse_weights(w: &[u8], out: &mut Vec<u8>) -> bool {
     const AL: u32 = 6;
     const SIZE: usize = 1 << AL;
@@ -412,7 +208,7 @@ fn try_write_fse_weights(w: &[u8], out: &mut Vec<u8>) -> bool {
         return false;
     }
     let start_len = out.len();
-    out.push(0); // 占位总长度字节
+    out.push(0);
     if write_dist_into(&probs[..=max_w], AL, out).is_none() {
         out.truncate(start_len);
         return false;
@@ -426,7 +222,6 @@ fn try_write_fse_weights(w: &[u8], out: &mut Vec<u8>) -> bool {
         out.truncate(start_len);
         return false;
     }
-    // 按符号串接状态格链表，O(1) 定位（每个符号仅占极少格子）
     let mut head = [u8::MAX; 16];
     let mut next_cell = [u8::MAX; SIZE];
     for i in (0..SIZE).rev() {
@@ -460,7 +255,6 @@ fn try_write_fse_weights(w: &[u8], out: &mut Vec<u8>) -> bool {
             bw.put(out, bits_val, nb);
         } else {
             if k == n - 2 {
-                // RFC 8878 §4.2.1.2：倒数第二个权重的状态转移必须消耗 >= 1 bit 以触发位流溢出终止
                 while idx != u8::MAX && cells[idx as usize].nb == 0 {
                     idx = next_cell[idx as usize];
                 }
@@ -511,7 +305,6 @@ fn encode_huff_part(part: &[u8], packed: &[u32; 256], out: &mut Vec<u8>) -> usiz
     let mut wp = 0usize;
     let mut acc = 0u64;
     let mut nbits = 0u32;
-    // 每批 5 个符号最多 5*11=55 位 + 最多 7 位残留 = 62 位 <= 64 位，单次 64 位写入零溢出。
     let mut chunks = part.rchunks_exact(5);
     for ch in &mut chunks {
         let pe = packed[ch[4] as usize];
@@ -616,12 +409,11 @@ pub(crate) fn write_literals_into(
         3
     };
     let min_gain = if fast_skip && n >= 4096 {
-        (n as u64) >> 2
+        (n as u64) >> 4
     } else {
         0
     };
 
-    // 单遍同时计算经验香农熵下界 N*H(P) 与旧树交叉熵比特数，支持零建树早退。
     let log2_n = log2_fp8(n as u32) as u64;
     let mut shannon_fp8 = 0u64;
     let mut prev_ok = scratch.active_valid;
@@ -644,7 +436,6 @@ pub(crate) fn write_literals_into(
         prev_bits = u64::MAX;
     }
 
-    // 定理 1（香农信源编码定理）：任何前缀码总比特数 >= N*H(P)，不达收益直接输出 Raw。
     let shannon_lb = ((shannon_bits + min_gain + streams as u64).div_ceil(8))
         + jump_bytes as u64
         + min_hl as u64;
@@ -654,7 +445,6 @@ pub(crate) fn write_literals_into(
         return;
     }
 
-    // 定理 2（KL 散度界）：旧树编码比特 <= 香农下界 + 树头开销时，复用旧树必优且跳过整套建树与权重 FSE 压缩。
     let fast_repeat = prev_bits != u64::MAX && prev_bits <= shannon_bits.saturating_add(280);
 
     let (ty, use_packed) = if fast_repeat {
@@ -730,7 +520,6 @@ pub(crate) fn write_literals_into(
                 out.extend_from_slice(lits);
                 return;
             }
-            // 按实际树头大小再次校验复用旧树是否更小
             if prev_bits != u64::MAX
                 && prev_bits <= fresh_bits.saturating_add((scratch.desc.len() as u64) << 3)
             {
@@ -812,19 +601,9 @@ pub(crate) fn encode_literals(lits: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod normalization_tests {
+mod tests {
     use super::*;
     use crate::huff;
-
-    #[test]
-    fn rounding_preserves_every_present_symbol() {
-        let counts: Vec<u32> = (1..=256).collect();
-        let p = normalize(&counts, 8).unwrap();
-        assert_eq!(p.iter().sum::<i32>(), 256);
-        assert!(p.iter().all(|&v| v == 1));
-        assert!(normalize(&[1; 257], 8).is_none());
-        assert!(normalize(&[0; 32], 8).is_none());
-    }
 
     #[test]
     fn encode_literals_tree_roundtrips_through_decoder() {
@@ -849,13 +628,11 @@ mod normalization_tests {
         assert!(!try_write_fse_weights(&[1u8; 192], &mut out));
         assert!(out.is_empty());
 
-        // 含极偏斜 0-bit 转移（probs = [-1, 63]）的各种零位置，必须均可被解码器精确还原
         for zero_pos in [0usize, 1, 95, 190, 191] {
             let mut w = vec![1u8; 192];
             w[zero_pos] = 0;
             out.clear();
             assert!(try_write_fse_weights(&w, &mut out), "zero_pos={zero_pos}");
-            // 校验权重表头可合法解析（总权重和 191*1，补足 65 非 2 的幂，但 FSE 权重本身应正好解出 192 个）
             let hb = out[0] as usize;
             let body = &out[1..1 + hb];
             let mut probs = [0i16; 256];
@@ -888,7 +665,6 @@ mod normalization_tests {
 
     #[test]
     fn kraft_truncation_handles_deep_fibonacci_tree() {
-        // 斐波那契频次使自然 Huffman 树深达 23 (> 11)，验证 O(n) Kraft 截断满足精确 Kraft 等式与解码往返
         let mut freq = [0u32; 256];
         let (mut a, mut b) = (1u32, 1u32);
         for slot in freq.iter_mut().take(24) {

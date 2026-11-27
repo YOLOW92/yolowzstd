@@ -6,11 +6,11 @@ use crate::{Error, Result};
 #[derive(Clone)]
 pub(crate) struct HuffTable {
     pub entries: [u16; 2048],
-    /// 2 符号 11 位展开表（8 KiB，L1d 驻留，每次 64 位装载可解 5 次 = 最多 10 字节）：
-    /// `bits 0..8 = sym0`, `bits 8..16 = sym1`, `bits 16..20 = total_nb (1..=11)`, `bit 24 = (count - 1)`。
-    pub pair_entries: [u32; 2048],
+    /// 2 符号 12 位展开表（16 KiB，按需延迟构建；每次 64 位装载 4 查表 = 4..=8 字节）：
+    /// `bits 0..8 = sym0`, `bits 8..16 = sym1`, `bits 16..20 = total_nb (1..=12)`, `bit 24 = (count - 1)`。
+    pub pair_entries: [u32; 4096],
     pub pair_ready: bool,
-    /// 按树结构精确计算的 P(l0+l1 <= 11) 收益判定。
+    /// 按树结构精确计算的 P(l0+l1 <= 12) 收益判定。
     pub pair_worth: bool,
 }
 
@@ -18,7 +18,7 @@ impl Default for HuffTable {
     fn default() -> Self {
         Self {
             entries: [0; 2048],
-            pair_entries: [0; 2048],
+            pair_entries: [0; 4096],
             pair_ready: false,
             pair_worth: false,
         }
@@ -26,7 +26,7 @@ impl Default for HuffTable {
 }
 
 impl HuffTable {
-    /// 按需构造 11 位 2 符号查找表（每棵新树最多构造一次，Repeat 块零重建）。
+    /// 按需构造 12 位 2 符号查找表（每棵新树最多构造一次，Repeat 块零重建）。
     #[inline(never)]
     fn ensure_pair_table(&mut self) {
         if self.pair_ready {
@@ -34,18 +34,18 @@ impl HuffTable {
         }
         let entries = &self.entries;
         let pair = &mut self.pair_entries;
-        for idx in 0..2048usize {
-            let e0 = entries[idx];
+        for idx in 0..4096usize {
+            let e0 = entries[idx >> 1];
             let s0 = (e0 >> 8) as u32;
             let l0 = (e0 & 15) as u32;
-            let e1 = entries[(idx << l0) & 2047];
+            let e1 = entries[((idx << l0) & 4095) >> 1];
             let l1 = (e1 & 15) as u32;
-            if l0 + l1 <= 11 {
-                let s1 = (e1 >> 8) as u32;
-                pair[idx] = s0 | (s1 << 8) | ((l0 + l1) << 16) | (1 << 24);
+            let sum = l0 + l1;
+            pair[idx] = if sum <= 12 {
+                s0 | (((e1 >> 8) as u32) << 8) | (sum << 16) | (1 << 24)
             } else {
-                pair[idx] = s0 | (l0 << 16);
-            }
+                s0 | (l0 << 16)
+            };
         }
         self.pair_ready = true;
     }
@@ -70,10 +70,10 @@ fn read_weights_into(data: &[u8], weights: &mut [u8; 256]) -> Result<(usize, u32
         let body = data
             .get(1..1 + hb)
             .ok_or(Error::Corrupt("huffman fse truncated"))?;
-        let mut probs = [0i16; 256];
-        let (plen, al, off) = fse::read_dist_into(body, 255, 6, &mut probs)?;
+        let mut probs = [0i16; 16];
+        let (plen, al, off) = fse::read_dist_into(body, 15, 6, &mut probs)?;
         let mut cells = [fse::Cell::default(); 64];
-        fse::build_into(&probs[..plen], al, &mut cells)?;
+        fse::build_weights_into(&probs[..plen], al, &mut cells)?;
         let mut r = RevBits::new(body.get(off..).ok_or(Error::Corrupt("huffman fse"))?)?;
         let mut s1 = r.read(al) as usize;
         let mut s2 = r.read(al) as usize;
@@ -184,12 +184,13 @@ pub(crate) fn read_tree_into(data: &[u8], table: &mut HuffTable) -> Result<usize
         cum[l] = acc;
     }
     let mut pair_hit_num = 0u64;
-    for l1 in 1..=10 {
-        pair_hit_num += len_mass[l1] * cum[11 - l1];
+    for (l1, &m1) in len_mass.iter().enumerate().skip(1) {
+        let max_l2 = (12 - l1).min(11);
+        pair_hit_num += m1 * cum[max_l2];
     }
     table.pair_ready = false;
-    // 精确双符号命中率 P(l1 + l2 <= 11) = pair_hit_num / 2048^2；>= 42% 时 11 位双符号表显著提速。
-    table.pair_worth = pair_hit_num >= ((2048u64 * 2048 * 42) / 100);
+    // 精确双符号命中率 P(l1 + l2 <= 12) >= 45% 时启用 12 位双符号表。
+    table.pair_worth = pair_hit_num >= ((2048u64 * 2048 * 45) / 100);
     Ok(used)
 }
 
@@ -266,135 +267,167 @@ fn stream_parts(data: &[u8], n: usize) -> Result<([&[u8]; 4], usize)> {
     Ok((parts, seg))
 }
 
+/// 4 路交错 12 位双符号解码内核（每轮 4 查表 = 最多 48 bit <= 57 bit，输出 4..=8 字节/流，
+/// 以显式长度检查 + 8 字节收尾切片 + 单次 16 位写回消除热循环边界检查与 Option 空指针分支）。
 #[inline(never)]
 fn decode_4x2(
-    pair: &[u32; 2048],
+    pair: &[u32; 4096],
     entries: &[u16; 2048],
     parts: [&[u8]; 4],
     seg: usize,
     out: &mut [u8],
 ) -> Result<()> {
-    let (pa, pb, pc, pd) = (parts[0], parts[1], parts[2], parts[3]);
-    let (mut ca, mut cb, mut cc, mut cd) = (
-        RevCursor::new(pa)?,
-        RevCursor::new(pb)?,
-        RevCursor::new(pc)?,
-        RevCursor::new(pd)?,
+    let (ca, cb, cc, cd) = (
+        RevCursor::new(parts[0])?,
+        RevCursor::new(parts[1])?,
+        RevCursor::new(parts[2])?,
+        RevCursor::new(parts[3])?,
     );
-    let (oa, rest) = out.split_at_mut(seg);
-    let (ob, rest) = rest.split_at_mut(seg);
-    let (oc, od) = rest.split_at_mut(seg);
+    let mut pa = &parts[0][..ca.cur.min(parts[0].len())];
+    let mut pb = &parts[1][..cb.cur.min(parts[1].len())];
+    let mut pc = &parts[2][..cc.cur.min(parts[2].len())];
+    let mut pd = &parts[3][..cd.cur.min(parts[3].len())];
+    let (mut boa, mut bob, mut boc, mut bod) = (
+        ca.bit_off & 7,
+        cb.bit_off & 7,
+        cc.bit_off & 7,
+        cd.bit_off & 7,
+    );
 
-    let pa = &pa[..ca.cur.min(pa.len())];
-    let pb = &pb[..cb.cur.min(pb.len())];
-    let pc = &pc[..cc.cur.min(pc.len())];
-    let pd = &pd[..cd.cur.min(pd.len())];
+    let (mut oa, rest) = out.split_at_mut(seg);
+    let (mut ob, rest) = rest.split_at_mut(seg);
+    let (mut oc, mut od) = rest.split_at_mut(seg);
 
-    let mut wpa = 0usize;
-    let mut wpb = 0usize;
-    let mut wpc = 0usize;
-    let mut wpd = 0usize;
+    macro_rules! pair_step4 {
+        ($ba:ident, $bb:ident, $bc:ident, $bd:ident,
+         $ta:ident, $tb:ident, $tc:ident, $td:ident,
+         $wa:ident, $wb:ident, $wc:ident, $wd:ident,
+         $ia:ident, $ib:ident, $ic:ident, $id:ident) => {{
+            let ea = pair[($ba >> 52) as usize];
+            let eb = pair[($bb >> 52) as usize];
+            let ec = pair[($bc >> 52) as usize];
+            let ed = pair[($bd >> 52) as usize];
 
-    if let (Some(la), Some(lb), Some(lc), Some(ld)) = (
-        oa.len().checked_sub(10),
-        ob.len().checked_sub(10),
-        oc.len().checked_sub(10),
-        od.len().checked_sub(10),
-    ) {
-        macro_rules! pair_step {
-            ($ba:ident, $bb:ident, $bc:ident, $bd:ident,
-             $ta:ident, $tb:ident, $tc:ident, $td:ident,
-             $wa:ident, $wb:ident, $wc:ident, $wd:ident,
-             $ia:ident, $ib:ident, $ic:ident, $id:ident) => {{
-                let ea = pair[($ba >> 53) as usize];
-                let eb = pair[($bb >> 53) as usize];
-                let ec = pair[($bc >> 53) as usize];
-                let ed = pair[($bd >> 53) as usize];
+            let na = (ea >> 16) & 15;
+            let nb = (eb >> 16) & 15;
+            let nc = (ec >> 16) & 15;
+            let nd = (ed >> 16) & 15;
 
-                let na = (ea >> 16) & 15;
-                let nb = (eb >> 16) & 15;
-                let nc = (ec >> 16) & 15;
-                let nd = (ed >> 16) & 15;
+            $ba <<= na;
+            $bb <<= nb;
+            $bc <<= nc;
+            $bd <<= nd;
+            $ta += na;
+            $tb += nb;
+            $tc += nc;
+            $td += nd;
 
-                $ba <<= na;
-                $bb <<= nb;
-                $bc <<= nc;
-                $bd <<= nd;
-                $ta += na;
-                $tb += nb;
-                $tc += nc;
-                $td += nd;
-
-                $wa[$ia] = ea as u8;
-                $wa[$ia + 1] = (ea >> 8) as u8;
-                $ia += 1 + ((ea >> 24) & 1) as usize;
-
-                $wb[$ib] = eb as u8;
-                $wb[$ib + 1] = (eb >> 8) as u8;
-                $ib += 1 + ((eb >> 24) & 1) as usize;
-
-                $wc[$ic] = ec as u8;
-                $wc[$ic + 1] = (ec >> 8) as u8;
-                $ic += 1 + ((ec >> 24) & 1) as usize;
-
-                $wd[$id] = ed as u8;
-                $wd[$id + 1] = (ed >> 8) as u8;
-                $id += 1 + ((ed >> 24) & 1) as usize;
-            }};
-        }
-
-        while wpa <= la
-            && wpb <= lb
-            && wpc <= lc
-            && wpd <= ld
-            && ca.cur.min(cb.cur).min(cc.cur).min(cd.cur) >= 8
-        {
-            let mut ba = ca.load_msb(pa);
-            let mut bb = cb.load_msb(pb);
-            let mut bc = cc.load_msb(pc);
-            let mut bd = cd.load_msb(pd);
-            let (mut ta, mut tb, mut tc, mut td) = (0u32, 0u32, 0u32, 0u32);
-            let wa: &mut [u8; 10] = (&mut oa[wpa..wpa + 10]).try_into().unwrap();
-            let wb: &mut [u8; 10] = (&mut ob[wpb..wpb + 10]).try_into().unwrap();
-            let wc: &mut [u8; 10] = (&mut oc[wpc..wpc + 10]).try_into().unwrap();
-            let wd: &mut [u8; 10] = (&mut od[wpd..wpd + 10]).try_into().unwrap();
-            let (mut ia, mut ib, mut ic, mut id) = (0usize, 0usize, 0usize, 0usize);
-
-            pair_step!(
-                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
-            );
-            pair_step!(
-                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
-            );
-            pair_step!(
-                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
-            );
-            pair_step!(
-                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
-            );
-            pair_step!(
-                ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
-            );
-
-            wpa += ia;
-            wpb += ib;
-            wpc += ic;
-            wpd += id;
-            ca.advance(ta);
-            cb.advance(tb);
-            cc.advance(tc);
-            cd.advance(td);
-        }
+            $wa[$ia..$ia + 2].copy_from_slice(&(ea as u16).to_le_bytes());
+            $ia += 1 + ((ea >> 24) & 1) as usize;
+            $wb[$ib..$ib + 2].copy_from_slice(&(eb as u16).to_le_bytes());
+            $ib += 1 + ((eb >> 24) & 1) as usize;
+            $wc[$ic..$ic + 2].copy_from_slice(&(ec as u16).to_le_bytes());
+            $ic += 1 + ((ec >> 24) & 1) as usize;
+            $wd[$id..$id + 2].copy_from_slice(&(ed as u16).to_le_bytes());
+            $id += 1 + ((ed >> 24) & 1) as usize;
+        }};
     }
 
-    let mut ra = ca.into_rev(pa);
-    let mut rb = cb.into_rev(pb);
-    let mut rc = cc.into_rev(pc);
-    let mut rd = cd.into_rev(pd);
-    finish_stream(entries, &mut ra, &mut oa[wpa..])?;
-    finish_stream(entries, &mut rb, &mut ob[wpb..])?;
-    finish_stream(entries, &mut rc, &mut oc[wpc..])?;
-    finish_stream(entries, &mut rd, &mut od[wpd..])?;
+    while pa.len() >= 8
+        && pb.len() >= 8
+        && pc.len() >= 8
+        && pd.len() >= 8
+        && oa.len() >= 8
+        && ob.len() >= 8
+        && oc.len() >= 8
+        && od.len() >= 8
+    {
+        let ca8: [u8; 8] = pa[pa.len() - 8..].try_into().unwrap();
+        let cb8: [u8; 8] = pb[pb.len() - 8..].try_into().unwrap();
+        let cc8: [u8; 8] = pc[pc.len() - 8..].try_into().unwrap();
+        let cd8: [u8; 8] = pd[pd.len() - 8..].try_into().unwrap();
+        let mut ba = u64::from_le_bytes(ca8) << boa;
+        let mut bb = u64::from_le_bytes(cb8) << bob;
+        let mut bc = u64::from_le_bytes(cc8) << boc;
+        let mut bd = u64::from_le_bytes(cd8) << bod;
+        let (mut ta, mut tb, mut tc, mut td) = (0u32, 0u32, 0u32, 0u32);
+        let (mut ia, mut ib, mut ic, mut id) = (0usize, 0usize, 0usize, 0usize);
+        let wa = &mut oa[..8];
+        let wb = &mut ob[..8];
+        let wc = &mut oc[..8];
+        let wd = &mut od[..8];
+
+        pair_step4!(
+            ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
+        );
+        pair_step4!(
+            ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
+        );
+        pair_step4!(
+            ba, bb, bc, bd, ta, tb, tc, td, wa, wb, wc, wd, ia, ib, ic, id
+        );
+        // 第 4 步免移位 ba..bd
+        {
+            let ea = pair[(ba >> 52) as usize];
+            let eb = pair[(bb >> 52) as usize];
+            let ec = pair[(bc >> 52) as usize];
+            let ed = pair[(bd >> 52) as usize];
+            ta += (ea >> 16) & 15;
+            tb += (eb >> 16) & 15;
+            tc += (ec >> 16) & 15;
+            td += (ed >> 16) & 15;
+            wa[ia..ia + 2].copy_from_slice(&(ea as u16).to_le_bytes());
+            ia += 1 + ((ea >> 24) & 1) as usize;
+            wb[ib..ib + 2].copy_from_slice(&(eb as u16).to_le_bytes());
+            ib += 1 + ((eb >> 24) & 1) as usize;
+            wc[ic..ic + 2].copy_from_slice(&(ec as u16).to_le_bytes());
+            ic += 1 + ((ec >> 24) & 1) as usize;
+            wd[id..id + 2].copy_from_slice(&(ed as u16).to_le_bytes());
+            id += 1 + ((ed >> 24) & 1) as usize;
+        }
+
+        let tota = boa + ta;
+        let totb = bob + tb;
+        let totc = boc + tc;
+        let totd = bod + td;
+        pa = &pa[..pa.len() - ((tota >> 3) & 7) as usize];
+        pb = &pb[..pb.len() - ((totb >> 3) & 7) as usize];
+        pc = &pc[..pc.len() - ((totc >> 3) & 7) as usize];
+        pd = &pd[..pd.len() - ((totd >> 3) & 7) as usize];
+        boa = tota & 7;
+        bob = totb & 7;
+        boc = totc & 7;
+        bod = totd & 7;
+        oa = &mut oa[ia..];
+        ob = &mut ob[ib..];
+        oc = &mut oc[ic..];
+        od = &mut od[id..];
+    }
+
+    let mut ra = RevCursor {
+        cur: pa.len(),
+        bit_off: boa,
+    }
+    .into_rev(pa);
+    let mut rb = RevCursor {
+        cur: pb.len(),
+        bit_off: bob,
+    }
+    .into_rev(pb);
+    let mut rc = RevCursor {
+        cur: pc.len(),
+        bit_off: boc,
+    }
+    .into_rev(pc);
+    let mut rd = RevCursor {
+        cur: pd.len(),
+        bit_off: bod,
+    }
+    .into_rev(pd);
+    finish_stream(entries, &mut ra, oa)?;
+    finish_stream(entries, &mut rb, ob)?;
+    finish_stream(entries, &mut rc, oc)?;
+    finish_stream(entries, &mut rd, od)?;
     Ok(())
 }
 
@@ -407,19 +440,30 @@ pub(crate) fn decode_into(
     if !four {
         return decode_single_stream(&t.entries, data, out);
     }
-    let (parts, seg) = stream_parts(data, out.len())?;
-    if t.pair_worth && (out.len() >= 4096 || t.pair_ready) {
+    let out_len = out.len();
+    let (parts, seg) = stream_parts(data, out_len)?;
+    if t.pair_worth && (out_len >= 4096 || t.pair_ready) {
         t.ensure_pair_table();
         return decode_4x2(&t.pair_entries, &t.entries, parts, seg, out);
     }
     let entries = &t.entries;
-    let (pa, pb, pc, pd) = (parts[0], parts[1], parts[2], parts[3]);
-    let (mut ca, mut cb, mut cc, mut cd) = (
-        RevCursor::new(pa)?,
-        RevCursor::new(pb)?,
-        RevCursor::new(pc)?,
-        RevCursor::new(pd)?,
+    let (ca, cb, cc, cd) = (
+        RevCursor::new(parts[0])?,
+        RevCursor::new(parts[1])?,
+        RevCursor::new(parts[2])?,
+        RevCursor::new(parts[3])?,
     );
+    let mut pa = &parts[0][..ca.cur.min(parts[0].len())];
+    let mut pb = &parts[1][..cb.cur.min(parts[1].len())];
+    let mut pc = &parts[2][..cc.cur.min(parts[2].len())];
+    let mut pd = &parts[3][..cd.cur.min(parts[3].len())];
+    let (mut boa, mut bob, mut boc, mut bod) = (
+        ca.bit_off & 7,
+        cb.bit_off & 7,
+        cc.bit_off & 7,
+        cd.bit_off & 7,
+    );
+
     let (oa, rest) = out.split_at_mut(seg);
     let (ob, rest) = rest.split_at_mut(seg);
     let (oc, od) = rest.split_at_mut(seg);
@@ -429,11 +473,6 @@ pub(crate) fn decode_into(
     let (oc_c, _) = oc.as_chunks_mut::<5>();
     let (od_c, _) = od.as_chunks_mut::<5>();
 
-    let pa = &pa[..ca.cur.min(pa.len())];
-    let pb = &pb[..cb.cur.min(pb.len())];
-    let pc = &pc[..cc.cur.min(pc.len())];
-    let pd = &pd[..cd.cur.min(pd.len())];
-
     let mut done_chunks = 0usize;
     for (((ao, bo), co), do_) in oa_c
         .iter_mut()
@@ -441,13 +480,17 @@ pub(crate) fn decode_into(
         .zip(oc_c.iter_mut())
         .zip(od_c.iter_mut())
     {
-        if ca.cur.min(cb.cur).min(cc.cur).min(cd.cur) < 8 {
+        if pa.len() < 8 || pb.len() < 8 || pc.len() < 8 || pd.len() < 8 {
             break;
         }
-        let mut ba = ca.load_msb(pa);
-        let mut bb = cb.load_msb(pb);
-        let mut bc = cc.load_msb(pc);
-        let mut bd = cd.load_msb(pd);
+        let ca8: [u8; 8] = pa[pa.len() - 8..].try_into().unwrap();
+        let cb8: [u8; 8] = pb[pb.len() - 8..].try_into().unwrap();
+        let cc8: [u8; 8] = pc[pc.len() - 8..].try_into().unwrap();
+        let cd8: [u8; 8] = pd[pd.len() - 8..].try_into().unwrap();
+        let mut ba = u64::from_le_bytes(ca8) << boa;
+        let mut bb = u64::from_le_bytes(cb8) << bob;
+        let mut bc = u64::from_le_bytes(cc8) << boc;
+        let mut bd = u64::from_le_bytes(cd8) << bod;
 
         let a0 = entries[(ba >> 53) as usize];
         let b0 = entries[(bb >> 53) as usize];
@@ -506,10 +549,18 @@ pub(crate) fn decode_into(
         let c4 = entries[(bc >> 53) as usize];
         let d4 = entries[(bd >> 53) as usize];
 
-        ca.advance(la0 + la1 + la2 + la3 + (a4 & 15) as u32);
-        cb.advance(lb0 + lb1 + lb2 + lb3 + (b4 & 15) as u32);
-        cc.advance(lc0 + lc1 + lc2 + lc3 + (c4 & 15) as u32);
-        cd.advance(ld0 + ld1 + ld2 + ld3 + (d4 & 15) as u32);
+        let tota = boa + la0 + la1 + la2 + la3 + (a4 & 15) as u32;
+        let totb = bob + lb0 + lb1 + lb2 + lb3 + (b4 & 15) as u32;
+        let totc = boc + lc0 + lc1 + lc2 + lc3 + (c4 & 15) as u32;
+        let totd = bod + ld0 + ld1 + ld2 + ld3 + (d4 & 15) as u32;
+        pa = &pa[..pa.len() - ((tota >> 3) & 7) as usize];
+        pb = &pb[..pb.len() - ((totb >> 3) & 7) as usize];
+        pc = &pc[..pc.len() - ((totc >> 3) & 7) as usize];
+        pd = &pd[..pd.len() - ((totd >> 3) & 7) as usize];
+        boa = tota & 7;
+        bob = totb & 7;
+        boc = totc & 7;
+        bod = totd & 7;
 
         *ao = [
             (a0 >> 8) as u8,
@@ -543,10 +594,26 @@ pub(crate) fn decode_into(
     }
 
     let done_bytes = done_chunks * 5;
-    let mut ra = ca.into_rev(pa);
-    let mut rb = cb.into_rev(pb);
-    let mut rc = cc.into_rev(pc);
-    let mut rd = cd.into_rev(pd);
+    let mut ra = RevCursor {
+        cur: pa.len(),
+        bit_off: boa,
+    }
+    .into_rev(pa);
+    let mut rb = RevCursor {
+        cur: pb.len(),
+        bit_off: bob,
+    }
+    .into_rev(pb);
+    let mut rc = RevCursor {
+        cur: pc.len(),
+        bit_off: boc,
+    }
+    .into_rev(pc);
+    let mut rd = RevCursor {
+        cur: pd.len(),
+        bit_off: bod,
+    }
+    .into_rev(pd);
     finish_stream(entries, &mut ra, &mut oa[done_bytes..])?;
     finish_stream(entries, &mut rb, &mut ob[done_bytes..])?;
     finish_stream(entries, &mut rc, &mut oc[done_bytes..])?;

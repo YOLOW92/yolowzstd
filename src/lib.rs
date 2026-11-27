@@ -8,9 +8,9 @@
 
 mod bits;
 mod chain;
-mod compact;
 mod dec;
 mod enc;
+mod entropy;
 mod fse;
 mod henc;
 mod huff;

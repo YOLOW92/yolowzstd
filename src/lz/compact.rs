@@ -1,6 +1,7 @@
 //! 缓存驻留输入保留紧凑位置表（支持代际戳记与三重复偏移），不为标签增加额外空间占用。
 use crate::enc::Seq;
-use crate::lz::{
+
+use super::{
     FastCfg, MIN, Position, apply_rep, h_4, h_long, h_short, match_first, match_score, mlen,
     probe_reps, rd, rd4,
 };

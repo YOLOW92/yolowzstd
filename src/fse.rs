@@ -81,15 +81,21 @@ pub(crate) fn read_dist_into(
 }
 
 pub(crate) fn build_into(probs: &[i16], al: u32, out: &mut [Cell]) -> Result<()> {
+    if al > 9 {
+        return Err(Error::Corrupt("fse accuracy too large"));
+    }
     let size = 1usize << al;
+    if size > out.len() {
+        return Err(Error::Corrupt("fse table too large"));
+    }
     let cells = &mut out[..size];
-    cells.fill(Cell::default());
     let mut high = size;
     let mut next = [0u32; 256];
+    let mut syms = [0u8; 512];
     for (s, &p) in probs.iter().enumerate() {
         if p == -1 {
             high -= 1;
-            cells[high].sym = s as u8;
+            syms[high] = s as u8;
             next[s] = 1;
         } else {
             next[s] = p.max(0) as u32;
@@ -100,7 +106,7 @@ pub(crate) fn build_into(probs: &[i16], al: u32, out: &mut [Cell]) -> Result<()>
     let mut pos = 0usize;
     for (s, &p) in probs.iter().enumerate() {
         for _ in 0..p.max(0) {
-            cells[pos].sym = s as u8;
+            syms[pos] = s as u8;
             pos = (pos + step) & mask;
             while pos >= high {
                 pos = (pos + step) & mask;
@@ -110,13 +116,67 @@ pub(crate) fn build_into(probs: &[i16], al: u32, out: &mut [Cell]) -> Result<()>
     if pos != 0 {
         return Err(Error::Corrupt("fse table spread"));
     }
-    for c in cells.iter_mut() {
-        let sym = c.sym as usize;
+    for (c, &sym_u8) in cells.iter_mut().zip(&syms[..size]) {
+        let sym = sym_u8 as usize;
         let x = next[sym];
         next[sym] = x + 1;
         let nb = al - (31 - x.leading_zeros());
-        c.nb = nb as u8;
-        c.base = ((x << nb) - size as u32) as u16;
+        *c = Cell {
+            sym: sym_u8,
+            nb: nb as u8,
+            base: ((x << nb) - size as u32) as u16,
+        };
+    }
+    Ok(())
+}
+
+/// 专为 Huffman 权重表（符号 0..=15，表长 ≤ 64）特化的零冗余栈建表。
+pub(crate) fn build_weights_into(probs: &[i16], al: u32, out: &mut [Cell; 64]) -> Result<()> {
+    if al > 6 {
+        return Err(Error::Corrupt("fse accuracy too large"));
+    }
+    let size = 1usize << al;
+    if probs.len() > 16 {
+        return build_into(probs, al, out);
+    }
+    let cells = &mut out[..size];
+    let mut high = size;
+    let mut next = [0u32; 16];
+    let mut syms = [0u8; 64];
+    for (s, &p) in probs.iter().enumerate() {
+        if p == -1 {
+            high -= 1;
+            syms[high] = s as u8;
+            next[s] = 1;
+        } else {
+            next[s] = p.max(0) as u32;
+        }
+    }
+    let step = (size >> 1) + (size >> 3) + 3;
+    let mask = size - 1;
+    let mut pos = 0usize;
+    for (s, &p) in probs.iter().enumerate() {
+        for _ in 0..p.max(0) {
+            syms[pos] = s as u8;
+            pos = (pos + step) & mask;
+            while pos >= high {
+                pos = (pos + step) & mask;
+            }
+        }
+    }
+    if pos != 0 {
+        return Err(Error::Corrupt("fse table spread"));
+    }
+    for (c, &sym_u8) in cells.iter_mut().zip(&syms[..size]) {
+        let sym = sym_u8 as usize;
+        let x = next[sym];
+        next[sym] = x + 1;
+        let nb = al - (31 - x.leading_zeros());
+        *c = Cell {
+            sym: sym_u8,
+            nb: nb as u8,
+            base: ((x << nb) - size as u32) as u16,
+        };
     }
     Ok(())
 }

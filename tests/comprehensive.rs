@@ -899,3 +899,250 @@ fn adversarial_fibonacci_huff_depth_and_many_3byte_sequences() {
         verify_with_zstd_cli(&z, &many_seqs, &format!("many_3byte_seqs L{lvl}"));
     }
 }
+
+#[test]
+fn adversarial_zero_copy_mt_decode_boundaries() {
+    // 构造 4 帧（总压缩 > 128 KiB 以触发 mt::decompress_parallel 零拷贝 split_at_mut 路径），
+    // 每帧末尾 32 字节精确覆盖 off=1..=15 重叠匹配、大字面量尾段与校验和。
+    let mut frames = Vec::new();
+    let mut expected = Vec::new();
+    for fi in 0..4usize {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64 ^ (fi as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let mut p: Vec<u8> = (0..40_000 + fi * 13)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as u8
+            })
+            .collect();
+        p.extend_from_slice(&structured_payload(40_000));
+        // 末尾 32 字节制造短偏移重叠匹配（off = 1, 2, 3, 7）
+        let pat_len = [1usize, 2, 3, 7][fi];
+        let seed: Vec<u8> = (0..pat_len).map(|k| b'A' + ((fi * 5 + k) as u8)).collect();
+        for _ in 0..(28 / pat_len) {
+            p.extend_from_slice(&seed);
+        }
+        let opts = CompressOptions::new(3)
+            .with_threads(1)
+            .with_checksum(fi % 2 == 0);
+        let z = compress_with(&p, &opts);
+        frames.extend_from_slice(&z);
+        expected.extend_from_slice(&p);
+    }
+    assert!(frames.len() >= 128 * 1024);
+
+    // 1) 非空 out 前缀 + 多线程零拷贝解压
+    let mut out = b"PREFIX!".to_vec();
+    let dec_opts = DecompressOptions::new().with_threads(4);
+    let exact_cap = out.len() + expected.len();
+    decompress_into_with(&frames, &mut out, &dec_opts, exact_cap).unwrap();
+    assert_eq!(&out[..7], b"PREFIX!");
+    assert_eq!(&out[7..], expected.as_slice());
+
+    // 2) max_out 精确边界截断返回 TooLarge，且与单线程解码保留前缀/完整块完全一致
+    let mut out_mt = b"KEEP".to_vec();
+    let mut out_st = b"KEEP".to_vec();
+    let small_cap = out_mt.len() + expected.len() - 1;
+    let err_mt = decompress_into_with(&frames, &mut out_mt, &dec_opts, small_cap).unwrap_err();
+    let err_st = decompress_into(&frames, &mut out_st, small_cap).unwrap_err();
+    assert!(matches!(err_mt, Error::TooLarge));
+    assert!(matches!(err_st, Error::TooLarge));
+    assert_eq!(out_mt, out_st);
+
+    // 3) 中途损坏帧返回 Err，且与单线程解码保留的前缀完整块完全一致
+    let mut bad = frames.clone();
+    let mid = bad.len() / 2;
+    bad[mid] ^= 0xFF;
+    let mut out_bad_mt = b"ORIG".to_vec();
+    let mut out_bad_st = b"ORIG".to_vec();
+    assert!(decompress_into_with(&bad, &mut out_bad_mt, &dec_opts, 4 * 1024 * 1024).is_err());
+    assert!(decompress_into(&bad, &mut out_bad_st, 4 * 1024 * 1024).is_err());
+    assert_eq!(out_bad_mt, out_bad_st);
+}
+
+#[test]
+fn adversarial_mt_multiblock_tail_tiny_frames_and_forged_fcs() {
+    let mut frames = Vec::new();
+    let mut expected = Vec::new();
+
+    // 1) 多块帧：倒数第二块恰好落入帧末 32 字节内（131072 + {1, 7, 16, 31, 32, 33}），
+    //    并在帧内混合 Raw / RLE / Compressed 块与末尾短偏移重叠匹配
+    for (fi, &extra) in [1usize, 7, 16, 31, 32, 33].iter().enumerate() {
+        let mut p = Vec::with_capacity(131_072 + extra);
+        if fi % 2 == 0 {
+            // 第 1 块含高熵不可压缩段（确保总压缩字节 >= 128 KiB 触发 mt 路径）+ 结构化可压缩段
+            let mut xs =
+                0x243F_6A88_85A3_08D3u64 ^ (fi as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for _ in 0..60_000 {
+                xs ^= xs << 13;
+                xs ^= xs >> 7;
+                xs ^= xs << 17;
+                p.push((xs >> 40) as u8);
+            }
+            p.extend_from_slice(&structured_payload(71_072));
+        } else {
+            // 第 1 块含纯 RLE 特征再接可压缩块
+            p.extend(std::iter::repeat_n(b'Z', 131_072));
+        }
+        let tail_pat = &b"abcaabbcc1234567890abcdefghijklmno"[..extra];
+        p.extend_from_slice(tail_pat);
+        let z = compress_with(
+            &p,
+            &CompressOptions::new(3)
+                .with_threads(1)
+                .with_checksum(fi % 2 == 0),
+        );
+        frames.extend_from_slice(&z);
+        expected.extend_from_slice(&p);
+
+        // 穿插跳过帧（skippable frame）
+        frames.extend_from_slice(&0x184D_2A53u32.to_le_bytes());
+        frames.extend_from_slice(&4u32.to_le_bytes());
+        frames.extend_from_slice(b"SKIP");
+    }
+
+    // 2) 小于 32B 的极短帧（0, 1, 3, 15, 31, 32, 33, 64B）与 window_log=10 多小块帧混拼
+    for &tiny_len in &[0usize, 1, 3, 15, 31, 32, 33, 64] {
+        let p = structured_payload(tiny_len);
+        let z = compress_with(&p, &CompressOptions::new(3).with_threads(1));
+        frames.extend_from_slice(&z);
+        expected.extend_from_slice(&p);
+    }
+    let small_win_payload = structured_payload(160 * 1024 + 19);
+    let z_sw = compress_with(
+        &small_win_payload,
+        &CompressOptions::new(3)
+            .with_threads(1)
+            .with_window_log(Some(10)),
+    );
+    frames.extend_from_slice(&z_sw);
+    expected.extend_from_slice(&small_win_payload);
+    assert!(frames.len() >= 128 * 1024);
+
+    let dec_opts = DecompressOptions::new().with_threads(4);
+    let mut dec = Decompressor::new();
+    let mut out_mt = b"HDR:".to_vec();
+    let exact_mt_cap = out_mt.len() + expected.len();
+    dec.decompress_into_with(&frames, &mut out_mt, &dec_opts, exact_mt_cap)
+        .unwrap();
+    assert_eq!(&out_mt[..4], b"HDR:");
+    assert_eq!(&out_mt[4..], expected.as_slice());
+
+    // 与单线程解码严格一致
+    let out_st = decompress(&frames, expected.len()).unwrap();
+    assert_eq!(out_st, expected);
+
+    // 3) 跨帧状态机（Predef -> RLE -> Repeat -> Custom -> 损坏帧 -> Raw -> Predef）复用校验
+    let mut corrupt_mid = frames.clone();
+    corrupt_mid[frames.len() / 3] ^= 0x5A;
+    let mut tmp = Vec::new();
+    let _ = dec.decompress_into_with(&corrupt_mid, &mut tmp, &dec_opts, expected.len() + 4096);
+    let raw_only = compress(&lcg(40, 999), 0);
+    assert_eq!(dec.decompress(&raw_only, 64).unwrap(), lcg(40, 999));
+    let mut out_after = Vec::new();
+    dec.decompress_into_with(&frames, &mut out_after, &dec_opts, expected.len())
+        .unwrap();
+    assert_eq!(out_after, expected);
+
+    // 4) 伪造超大 Frame_Content_Size 防 OOM / 防巨额清零 DoS 校验：
+    //    两帧各 1 个小压缩块却声称各 512 MiB（总计 1 GiB），总输入 > 128 KiB 进入 mt 路径，
+    //    scan_frames 必须按块上限直接拒绝对 1 GiB 预分配！
+    let mut forged = Vec::with_capacity(140 * 1024);
+    for _ in 0..2 {
+        // 合法魔数 + Single_Segment=0, FCS=4B (0x80), Window_Desc=0x50 (1 MiB), FCS=512 MiB
+        forged.extend_from_slice(&0xFD2F_B528u32.to_le_bytes());
+        forged.push(0x80);
+        forged.push(0x50);
+        forged.extend_from_slice(&(512u32 << 20).to_le_bytes());
+        // 单个 70 KiB 压缩块（last=1, type=2, size=70 KiB），总块上限仅 128 KiB << 512 MiB
+        let bsz = 70 * 1024usize;
+        let bh = ((bsz << 3) | 4 | 1) as u32;
+        forged.extend_from_slice(&bh.to_le_bytes()[..3]);
+        forged.extend(std::iter::repeat_n(0u8, bsz));
+    }
+    assert!(forged.len() >= 128 * 1024);
+    let mut out_forged = b"SAFE".to_vec();
+    let err = dec
+        .decompress_into_with(&forged, &mut out_forged, &dec_opts, 2usize << 30)
+        .unwrap_err();
+    assert!(matches!(err, Error::Corrupt(_)));
+    assert!(
+        out_forged.capacity() < (64 << 20),
+        "forged FCS caused unexpected giant pre-allocation: {} bytes",
+        out_forged.capacity()
+    );
+    assert_eq!(&out_forged[..4], b"SAFE");
+
+    // 5) 跳过帧 u32::MAX 长度溢出边界（覆盖 32 位算术安全路径）
+    for &skip_sz in &[u32::MAX - 3, u32::MAX - 1, u32::MAX] {
+        let mut bad_skip = Vec::new();
+        bad_skip.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+        bad_skip.extend_from_slice(&skip_sz.to_le_bytes());
+        assert!(matches!(
+            decompress(&bad_skip, 1024),
+            Err(Error::Corrupt("skip frame size"))
+        ));
+    }
+
+    // 6) 多帧并行变异 fuzz：300 次随机位翻转不得 panic，且与单线程严格等价
+    let mut rng = 0xD1B5_4A32_D192_ED03u64;
+    let mut dec_mt = Decompressor::new();
+    let mut dec_st = Decompressor::new();
+    let mut buf_mt = Vec::new();
+    let mut buf_st = Vec::new();
+    for _ in 0..300 {
+        let mut mutated = frames.clone();
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let flips = 1 + ((rng >> 56) as usize % 3);
+        for _ in 0..flips {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let idx = (rng as usize) % mutated.len();
+            mutated[idx] ^= ((rng >> 40) as u8).max(1);
+        }
+        buf_mt.clear();
+        buf_mt.extend_from_slice(b"PFX");
+        buf_st.clear();
+        buf_st.extend_from_slice(b"PFX");
+        let cap = expected.len() + 64 * 1024;
+        let r_mt = dec_mt.decompress_into_with(&mutated, &mut buf_mt, &dec_opts, cap);
+        let r_st = dec_st.decompress_into(&mutated, &mut buf_st, cap);
+        assert_eq!(r_mt.is_ok(), r_st.is_ok());
+        assert_eq!(buf_mt, buf_st);
+    }
+}
+
+#[test]
+fn adversarial_opt_chunk_tail_truncation_exact_boundaries() {
+    // 针对 OptParser OPT_CHUNK=4096 边界修正（idx.min(last_pos).min(end - cur)）：
+    // 构造不含 sufficient 长匹配的密集短重复序列，在 4095/4096/4097/4105/8192/16384 块边界验证闭环
+    let make_dense = |len: usize, seed: u64| -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut rng = seed;
+        let toks: [&[u8]; 8] = [
+            b"alpha_", b"beta__", b"gamma_", b"delta_", b"eps___", b"zeta__", b"eta___", b"theta_",
+        ];
+        while out.len() < len {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let t = toks[((rng >> 56) as usize) & 7];
+            out.extend_from_slice(t);
+            out.push(b'0' + ((rng >> 48) % 10) as u8);
+        }
+        out.truncate(len);
+        out
+    };
+
+    for &sz in &[4095usize, 4096, 4097, 4105, 4130, 8192, 12_300] {
+        let data = make_dense(sz, sz as u64 ^ 0x55AA_1122_3344_7788);
+        for &lvl in &[16, 19, 22] {
+            let z = compress(&data, lvl);
+            let dec = decompress(&z, data.len()).unwrap();
+            assert_eq!(dec, data, "opt_chunk boundary sz={sz} L{lvl}");
+            if sz == 4096 || sz == 4105 {
+                verify_with_zstd_cli(&z, &data, &format!("opt_chunk sz={sz} L{lvl}"));
+            }
+        }
+    }
+}

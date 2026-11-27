@@ -1,0 +1,767 @@
+//! 序列码编码、L1 驻留无分支 FSE 编码表、8.8 定点交叉熵表选择与逆向位流写入。
+use crate::dec::{LL_BASE, LL_DEFAULT, ML_BASE, ML_DEFAULT, OF_DEFAULT};
+use crate::entropy::{log2_fp8, normalize_into, opt_fse_al, write_dist_into};
+#[cfg(test)]
+use crate::fse;
+
+/// 无自有缓冲的流式位累加器，直接写入调用方 `&mut Vec<u8>`。
+pub(crate) struct BitAcc {
+    acc: u64,
+    n: u32,
+}
+
+impl BitAcc {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        Self { acc: 0, n: 0 }
+    }
+
+    #[inline(always)]
+    pub fn put(&mut self, out: &mut Vec<u8>, v: u32, bits: u32) {
+        if bits == 0 {
+            return;
+        }
+        self.acc |= ((v as u64) & ((1u64 << bits) - 1)) << self.n;
+        self.n += bits;
+        if self.n >= 32 {
+            out.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.n -= 32;
+        }
+    }
+
+    #[inline(always)]
+    pub fn flush_bytes(mut self, out: &mut Vec<u8>) {
+        while self.n > 0 {
+            out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.n = self.n.saturating_sub(8);
+        }
+    }
+
+    #[inline(always)]
+    pub fn finish(mut self, out: &mut Vec<u8>) {
+        self.put(out, 1, 1);
+        self.flush_bytes(out);
+    }
+}
+
+/// 小值（< N）直接查表得到码；用 `bases` 里的基值反推。
+const fn small_codes<const N: usize, const M: usize>(
+    bases: &[(u32, u32); M],
+    delta: u32,
+) -> [u8; N] {
+    let mut t = [0u8; N];
+    let mut v = 0;
+    let mut c = 0;
+    while v < N {
+        while c + 1 < M && (bases[c + 1].0 as usize) <= v + delta as usize {
+            c += 1;
+        }
+        t[v] = c as u8;
+        v += 1;
+    }
+    t
+}
+
+static LL_TAB: [u8; 64] = small_codes(&LL_BASE, 0);
+static ML_TAB: [u8; 128] = small_codes(&ML_BASE, 3);
+
+#[inline(always)]
+pub(crate) fn ll_code(v: u32) -> (u32, u32, u32) {
+    let c = if v < 64 {
+        LL_TAB[v as usize] as u32
+    } else {
+        19 + (31 - v.leading_zeros())
+    };
+    let (base, bits) = LL_BASE[c as usize];
+    (c, bits, v - base)
+}
+
+#[inline(always)]
+pub(crate) fn ml_code(v: u32) -> (u32, u32, u32) {
+    let m = v - 3;
+    let c = if m < 128 {
+        ML_TAB[m as usize] as u32
+    } else {
+        36 + (31 - m.leading_zeros())
+    };
+    let (base, bits) = ML_BASE[c as usize];
+    (c, bits, v - base)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Seq {
+    pub ll: u32,
+    pub ml: u32,
+    pub off: u32,
+    /// 0 = 普通偏移 (`ofv = off + 3`), 1..=3 = 重复偏移码 (`ofv = rep_code`).
+    pub rep_code: u8,
+}
+
+/// L1 缓存驻留的 FSE 编码查找表（无分支转移，支持 Predef / RLE / Custom / Repeat）。
+#[derive(Clone)]
+struct SymTable {
+    al: u32,
+    size: u32,
+    symbols: u64,
+    delta_nb: [u32; 64],
+    sym_off: [i16; 64],
+    cumul: [u16; 64],
+    state_table: [u16; 512],
+    /// 自定义表或 RLE 的原始归一化概率，用于评估下块 `Repeat` 收益。
+    valid: bool,
+    is_rle: bool,
+    probs: [i16; 64],
+    probs_len: usize,
+}
+
+impl SymTable {
+    fn empty() -> Self {
+        Self {
+            al: 0,
+            size: 1,
+            symbols: 0,
+            delta_nb: [0; 64],
+            sym_off: [0; 64],
+            cumul: [0; 64],
+            state_table: [0; 512],
+            valid: false,
+            is_rle: false,
+            probs: [0; 64],
+            probs_len: 0,
+        }
+    }
+
+    fn set_rle(&mut self, sym: u8) {
+        self.al = 0;
+        self.size = 1;
+        self.symbols = 1u64 << sym;
+        self.delta_nb.fill(0);
+        self.sym_off.fill(0);
+        self.cumul.fill(0);
+        self.sym_off[sym as usize] = -1;
+        self.state_table[0] = 1;
+        self.valid = true;
+        self.is_rle = true;
+        self.probs.fill(0);
+        self.probs[0] = sym as i16;
+        self.probs_len = 1;
+    }
+
+    /// 直接从归一化分布扩散填表并预加 `size` 基址，热路径无需再构造解码器 `Cell` 或加 `self.size`。
+    fn fill_from_probs(&mut self, probs: &[i16], al: u32) -> bool {
+        let size = 1u32 << al;
+        let size_usize = size as usize;
+        let mut syms = [0u8; 512];
+        let mut high = size_usize;
+        let mut symbols = 0u64;
+        let mut total = 0u16;
+        self.cumul.fill(0);
+        self.delta_nb.fill(0);
+        self.sym_off.fill(0);
+        for (s, &p) in probs.iter().enumerate() {
+            self.cumul[s] = total;
+            if p != 0 {
+                let c = if p == -1 {
+                    high -= 1;
+                    syms[high] = s as u8;
+                    1u32
+                } else {
+                    p.max(0) as u32
+                };
+                symbols |= 1u64 << s;
+                total += c as u16;
+                let k = 31 - c.leading_zeros();
+                let max_bits_out = al - k;
+                let thresh = c << max_bits_out;
+                self.delta_nb[s] = (max_bits_out << 16).wrapping_sub(thresh);
+                self.sym_off[s] = self.cumul[s] as i16 - c as i16;
+            }
+        }
+        let step = (size_usize >> 1) + (size_usize >> 3) + 3;
+        let mask = size_usize - 1;
+        let mut pos = 0usize;
+        for (s, &p) in probs.iter().enumerate() {
+            for _ in 0..p.max(0) {
+                syms[pos] = s as u8;
+                pos = (pos + step) & mask;
+                while pos >= high {
+                    pos = (pos + step) & mask;
+                }
+            }
+        }
+        if pos != 0 {
+            return false;
+        }
+        let mut cursor = self.cumul;
+        for (idx, &sym) in syms[..size_usize].iter().enumerate() {
+            let s = sym as usize;
+            let slot = cursor[s] as usize;
+            cursor[s] += 1;
+            self.state_table[slot & 511] = (idx + size_usize) as u16;
+        }
+        self.al = al;
+        self.size = size;
+        self.symbols = symbols;
+        self.probs.fill(0);
+        self.probs[..probs.len()].copy_from_slice(probs);
+        self.probs_len = probs.len();
+        self.valid = true;
+        self.is_rle = false;
+        true
+    }
+
+    fn from_predef(dist: &[i16], al: u32) -> Self {
+        let mut st = Self::empty();
+        assert!(st.fill_from_probs(dist, al), "预定义表合法");
+        st
+    }
+
+    #[inline(always)]
+    fn init_state(&self, sym: u32) -> u32 {
+        self.state_table[(self.cumul[(sym as usize) & 63] as usize) & 511] as u32
+    }
+
+    #[inline(always)]
+    fn step_state(&self, sym: u32, state: &mut u32) -> (u32, u32) {
+        const MASK32: [u32; 16] = [
+            0, 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767,
+        ];
+        let s = (sym as usize) & 63;
+        let x = *state;
+        let nb = (x + self.delta_nb[s]) >> 16;
+        let bits = x & MASK32[(nb as usize) & 15];
+        let x_occ = x >> nb;
+        let next_idx = ((x_occ as i32 + self.sym_off[s] as i32) as usize) & 511;
+        *state = self.state_table[next_idx] as u32;
+        (nb, bits)
+    }
+}
+
+pub(super) struct EncTables {
+    ll: SymTable,
+    of: SymTable,
+    ml: SymTable,
+}
+
+impl EncTables {
+    fn new() -> Self {
+        Self {
+            ll: SymTable::from_predef(&LL_DEFAULT, 6),
+            of: SymTable::from_predef(&OF_DEFAULT, 5),
+            ml: SymTable::from_predef(&ML_DEFAULT, 6),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CompKind {
+    Ll,
+    Of,
+    Ml,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SeqBits {
+    extra: u64,
+    lc: u8,
+    oc: u8,
+    mc: u8,
+    eb: u8,
+}
+
+#[derive(Clone, Copy)]
+enum ModeSel {
+    Predef,
+    Cur,
+    Prev,
+}
+
+pub(super) struct SeqScratch {
+    cur: [SymTable; 3],
+    prev: [SymTable; 3],
+    prev_is_predef: [bool; 3],
+    pub desc: Vec<u8>,
+    encoded: Vec<SeqBits>,
+    seq_buf: Vec<u8>,
+}
+
+impl SeqScratch {
+    pub fn new() -> Self {
+        Self {
+            cur: [SymTable::empty(), SymTable::empty(), SymTable::empty()],
+            prev: [SymTable::empty(), SymTable::empty(), SymTable::empty()],
+            prev_is_predef: [false; 3],
+            desc: Vec::with_capacity(256),
+            encoded: Vec::with_capacity(4096),
+            seq_buf: vec![0u8; 64 * 1024],
+        }
+    }
+
+    pub fn reset_frame(&mut self) {
+        for p in &mut self.prev {
+            p.valid = false;
+        }
+        self.prev_is_predef = [false; 3];
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.desc.clear();
+        self.desc.shrink_to_fit();
+        self.encoded.clear();
+        self.encoded.shrink_to_fit();
+        self.seq_buf.clear();
+        self.seq_buf.shrink_to_fit();
+    }
+}
+
+pub(super) fn predef_tables() -> &'static EncTables {
+    static TABLES: std::sync::OnceLock<EncTables> = std::sync::OnceLock::new();
+    TABLES.get_or_init(EncTables::new)
+}
+
+/// 以 8.8 定点精确计算分布 `cnt` 在已有表 `tab` 下的交叉熵总比特（无分支近似误差 < 0.005 bit/符号）。
+#[inline]
+fn cross_entropy_fp8(cnt: &[u32], tab: &SymTable) -> u64 {
+    let al_fp8 = (tab.al << 8) as u64;
+    let mut sum = 0u64;
+    for (s, &c) in cnt.iter().enumerate() {
+        if c > 0 {
+            let p = tab.probs[s].unsigned_abs().max(1) as u32;
+            sum += c as u64 * al_fp8.saturating_sub(log2_fp8(p) as u64);
+        }
+    }
+    sum
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_component(
+    kind: CompKind,
+    cnt: &[u32],
+    max_al: u32,
+    shift: u32,
+    total_seqs: usize,
+    pre: &SymTable,
+    cur: &mut SymTable,
+    prev: &SymTable,
+    fast_mode: bool,
+    modes: &mut u8,
+    desc: &mut Vec<u8>,
+) -> ModeSel {
+    let mut active_mask = 0u64;
+    let mut active_cnt = 0u32;
+    let mut last_sym = 0u8;
+    for (s, &c) in cnt.iter().enumerate() {
+        if c > 0 {
+            active_mask |= 1u64 << s;
+            active_cnt += 1;
+            last_sym = s as u8;
+        }
+    }
+    let required = (active_mask & !pre.symbols) != 0;
+
+    // 1) 单符号时优先 RLE（仅需 1 字节，且所有序列位宽为 0）
+    if active_cnt == 1 {
+        *modes |= 1 << shift;
+        desc.push(last_sym);
+        cur.set_rle(last_sym);
+        return ModeSel::Cur;
+    }
+
+    // 2) 极短序列直接用预定义表（0 字节表头 + 零信息熵扫描）
+    if !required && total_seqs < 24 {
+        return ModeSel::Predef;
+    }
+
+    let eff_max_al = if fast_mode { max_al.min(7) } else { max_al };
+    let al = opt_fse_al(total_seqs, active_cnt, eff_max_al);
+
+    // 3) 以 8.8 定点交叉熵统一比较 Predef / Repeat / Custom（零表头 vs 自定义表头代价）
+    let can_predef = !required;
+    let can_prev = prev.valid && !prev.is_rle && (active_mask & !prev.symbols) == 0;
+
+    if can_predef || can_prev {
+        let log2_n = log2_fp8(total_seqs.max(1) as u32) as u64;
+        let mut ideal_fp8 = 0u64;
+        for &c in cnt {
+            if c > 0 {
+                ideal_fp8 += c as u64 * log2_n.saturating_sub(log2_fp8(c) as u64);
+            }
+        }
+        // Custom 表头估算：约 (active_cnt * (al + 2) + 32) 比特；L1 快速档放宽复用阈值免频繁建表
+        let extra_margin = if fast_mode {
+            (total_seqs as u64) << 5
+        } else {
+            0
+        };
+        let custom_est_fp8 =
+            ideal_fp8 + (((active_cnt * (al + 2) + 32) as u64) << 8) + extra_margin;
+
+        let predef_fp8 = if can_predef {
+            cross_entropy_fp8(cnt, pre)
+        } else {
+            u64::MAX
+        };
+        let prev_fp8 = if can_prev {
+            cross_entropy_fp8(cnt, prev)
+        } else {
+            u64::MAX
+        };
+
+        let best_zero_hdr = predef_fp8.min(prev_fp8);
+        if best_zero_hdr <= custom_est_fp8 {
+            if prev_fp8 < predef_fp8 {
+                *modes |= 3 << shift;
+                return ModeSel::Prev;
+            }
+            return ModeSel::Predef;
+        }
+    }
+
+    // 4) 构建 Custom_Mode（复用预分配缓冲，最小 KL 归一化 + MDL 精度）
+    let mut probs_i32 = [0i32; 64];
+    let n = cnt.len();
+    if normalize_into(cnt, al, &mut probs_i32[..n]).is_some() {
+        let mark = desc.len();
+        if write_dist_into(&probs_i32[..n], al, desc).is_some() {
+            let mut probs_i16 = [0i16; 64];
+            for i in 0..n {
+                probs_i16[i] = probs_i32[i] as i16;
+            }
+            if cur.fill_from_probs(&probs_i16[..n], al) {
+                *modes |= 2 << shift;
+                return ModeSel::Cur;
+            }
+        }
+        desc.truncate(mark);
+    }
+
+    let _ = kind;
+    ModeSel::Predef
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn flush_long_seq(
+    buf: &mut [u8],
+    wp: &mut usize,
+    acc: &mut u64,
+    nbits: &mut u32,
+    fse: u64,
+    fse_nb: u32,
+    extra: u64,
+    eb: u32,
+) {
+    macro_rules! flush_one {
+        () => {{
+            buf[*wp..*wp + 8].copy_from_slice(&acc.to_le_bytes());
+            let bytes = ((*nbits >> 3) & 7) as usize;
+            *wp += bytes;
+            *acc >>= bytes << 3;
+            *nbits &= 7;
+        }};
+    }
+    *acc |= fse << *nbits;
+    *nbits += fse_nb;
+    flush_one!();
+    if eb <= 56 {
+        *acc |= extra << *nbits;
+        *nbits += eb;
+        flush_one!();
+    } else {
+        *acc |= (extra & 0xFFFF_FFFF) << *nbits;
+        *nbits += 32;
+        flush_one!();
+        *acc |= (extra >> 32) << *nbits;
+        *nbits += eb - 32;
+        flush_one!();
+    }
+}
+
+#[inline(never)]
+pub(super) fn write_seqs_into(
+    seqs: &[Seq],
+    pre: &EncTables,
+    sc: &mut SeqScratch,
+    fast_mode: bool,
+    out: &mut Vec<u8>,
+) {
+    const OC_MASK: [u32; 32] = [
+        0,
+        1,
+        3,
+        7,
+        15,
+        31,
+        63,
+        127,
+        255,
+        511,
+        1023,
+        2047,
+        4095,
+        8191,
+        16383,
+        32767,
+        65535,
+        0x1_FFFF,
+        0x3_FFFF,
+        0x7_FFFF,
+        0xF_FFFF,
+        0x1F_FFFF,
+        0x3F_FFFF,
+        0x7F_FFFF,
+        0xFF_FFFF,
+        0x1FF_FFFF,
+        0x3FF_FFFF,
+        0x7FF_FFFF,
+        0xFFF_FFFF,
+        0x1FFF_FFFF,
+        0x3FFF_FFFF,
+        0x7FFF_FFFF,
+    ];
+    let mut cl = [0u32; 64];
+    let mut co = [0u32; 32];
+    let mut cm = [0u32; 64];
+    let n = seqs.len();
+    if sc.encoded.len() < n {
+        sc.encoded.resize(n, SeqBits::default());
+    }
+    for (dst, s) in sc.encoded[..n].iter_mut().zip(seqs) {
+        let (lc, lb, lv) = ll_code(s.ll);
+        let (mc, mb, mv) = ml_code(s.ml);
+        let ofv = if s.rep_code != 0 {
+            s.rep_code as u32
+        } else {
+            s.off + 3
+        };
+        let oc = 31 - ofv.leading_zeros();
+        let ov = ofv & OC_MASK[(oc as usize) & 31];
+        cl[(lc as usize) & 63] += 1;
+        co[(oc as usize) & 31] += 1;
+        cm[(mc as usize) & 63] += 1;
+        let extra = (lv as u64) | ((mv as u64) << lb) | ((ov as u64) << (lb + mb));
+        *dst = SeqBits {
+            extra,
+            lc: lc as u8,
+            oc: oc as u8,
+            mc: mc as u8,
+            eb: (lb + mb + oc) as u8,
+        };
+    }
+
+    let mut modes = 0u8;
+    sc.desc.clear();
+    let prev_ll = if sc.prev_is_predef[0] {
+        &pre.ll
+    } else {
+        &sc.prev[0]
+    };
+    let prev_of = if sc.prev_is_predef[1] {
+        &pre.of
+    } else {
+        &sc.prev[1]
+    };
+    let prev_ml = if sc.prev_is_predef[2] {
+        &pre.ml
+    } else {
+        &sc.prev[2]
+    };
+    let sel_ll = select_component(
+        CompKind::Ll,
+        &cl[..36],
+        9,
+        6,
+        n,
+        &pre.ll,
+        &mut sc.cur[0],
+        prev_ll,
+        fast_mode,
+        &mut modes,
+        &mut sc.desc,
+    );
+    let sel_of = select_component(
+        CompKind::Of,
+        &co,
+        8,
+        4,
+        n,
+        &pre.of,
+        &mut sc.cur[1],
+        prev_of,
+        fast_mode,
+        &mut modes,
+        &mut sc.desc,
+    );
+    let sel_ml = select_component(
+        CompKind::Ml,
+        &cm[..53],
+        9,
+        2,
+        n,
+        &pre.ml,
+        &mut sc.cur[2],
+        prev_ml,
+        fast_mode,
+        &mut modes,
+        &mut sc.desc,
+    );
+
+    let tl = match sel_ll {
+        ModeSel::Predef => &pre.ll,
+        ModeSel::Cur => &sc.cur[0],
+        ModeSel::Prev => prev_ll,
+    };
+    let to = match sel_of {
+        ModeSel::Predef => &pre.of,
+        ModeSel::Cur => &sc.cur[1],
+        ModeSel::Prev => prev_of,
+    };
+    let tm = match sel_ml {
+        ModeSel::Predef => &pre.ml,
+        ModeSel::Cur => &sc.cur[2],
+        ModeSel::Prev => prev_ml,
+    };
+
+    out.push(modes);
+    out.extend_from_slice(&sc.desc);
+
+    let need = n * 12 + 48;
+    if sc.seq_buf.len() < need {
+        sc.seq_buf.resize(need, 0);
+    }
+    let buf = &mut sc.seq_buf[..need];
+    let mut wp = 0usize;
+    let mut acc = 0u64;
+    let mut nbits = 0u32;
+
+    macro_rules! flush64 {
+        () => {{
+            buf[wp..wp + 8].copy_from_slice(&acc.to_le_bytes());
+            let bytes = ((nbits >> 3) & 7) as usize;
+            wp += bytes;
+            acc >>= bytes << 3;
+            nbits &= 7;
+        }};
+    }
+
+    let last = sc.encoded[n - 1];
+    let mut stl = tl.init_state(last.lc as u32);
+    let mut sto = to.init_state(last.oc as u32);
+    let mut stm = tm.init_state(last.mc as u32);
+
+    let leb = last.eb as u32;
+    if leb <= 56 {
+        acc |= last.extra << nbits;
+        nbits += leb;
+        flush64!();
+    } else {
+        acc |= (last.extra & 0xFFFF_FFFF) << nbits;
+        nbits += 32;
+        flush64!();
+        acc |= (last.extra >> 32) << nbits;
+        nbits += leb - 32;
+        flush64!();
+    }
+
+    for &sb in sc.encoded[..n - 1].iter().rev() {
+        if wp + 32 > buf.len() {
+            break;
+        }
+        let (n1, v1) = to.step_state(sb.oc as u32, &mut sto);
+        let (n2, v2) = tm.step_state(sb.mc as u32, &mut stm);
+        let (n3, v3) = tl.step_state(sb.lc as u32, &mut stl);
+
+        let fse = (v1 | (v2 << n1) | (v3 << (n1 + n2))) as u64;
+        let fse_nb = n1 + n2 + n3;
+        let eb = sb.eb as u32;
+        if fse_nb + eb <= 56 {
+            acc |= (fse | (sb.extra << fse_nb)) << nbits;
+            nbits += fse_nb + eb;
+            flush64!();
+        } else {
+            flush_long_seq(
+                buf, &mut wp, &mut acc, &mut nbits, fse, fse_nb, sb.extra, eb,
+            );
+        }
+    }
+
+    let final_bits =
+        (stm - tm.size) | ((sto - to.size) << tm.al) | ((stl - tl.size) << (tm.al + to.al));
+    let final_nb = tm.al + to.al + tl.al;
+    acc |= (final_bits as u64) << nbits;
+    nbits += final_nb;
+    flush64!();
+    acc |= 1u64 << nbits;
+    nbits += 1;
+    while nbits > 0 {
+        buf[wp] = acc as u8;
+        wp += 1;
+        acc >>= 8;
+        nbits = nbits.saturating_sub(8);
+    }
+    out.extend_from_slice(&buf[..wp]);
+}
+
+#[inline]
+pub(super) fn commit_seq_tables(sc: &mut SeqScratch, modes: u8) {
+    for (idx, shift) in [(0usize, 6u32), (1, 4), (2, 2)] {
+        match (modes >> shift) & 3 {
+            0 => sc.prev_is_predef[idx] = true,
+            1 | 2 => {
+                sc.prev_is_predef[idx] = false;
+                std::mem::swap(&mut sc.cur[idx], &mut sc.prev[idx]);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_large_offsets_use_rle_or_custom_table() {
+        let pre = predef_tables();
+        let mut sc = SeqScratch::new();
+        {
+            let seqs = [Seq {
+                ll: 0,
+                ml: 4,
+                off: 1 << 29,
+                rep_code: 0,
+            }];
+            let mut body = Vec::new();
+            write_seqs_into(&seqs, pre, &mut sc, false, &mut body);
+            assert_eq!((body[0] >> 4) & 3, 1);
+            assert_eq!(body[1], 0);
+            assert_eq!(body[2], 31 - ((1u32 << 29) + 3).leading_zeros() as u8);
+        }
+        sc.reset_frame();
+        let seqs = [
+            Seq {
+                ll: 0,
+                ml: 4,
+                off: 1 << 29,
+                rep_code: 0,
+            },
+            Seq {
+                ll: 0,
+                ml: 4,
+                off: u32::MAX - 3,
+                rep_code: 0,
+            },
+        ];
+        let mut body = Vec::new();
+        write_seqs_into(&seqs, pre, &mut sc, false, &mut body);
+        assert_eq!((body[0] >> 4) & 3, 2);
+        let (decoded, _used) = fse::read_table(&sc.desc[1..], 31, 8).unwrap();
+        let sym1 = 31 - ((1u32 << 29) + 3).leading_zeros();
+        let sym2 = 31 - u32::MAX.leading_zeros();
+        assert!(decoded.cells.iter().any(|c| c.sym as u32 == sym1));
+        assert!(decoded.cells.iter().any(|c| c.sym as u32 == sym2));
+    }
+}

@@ -5,9 +5,12 @@
 //! - 解码端：先按块头线性扫描出帧边界（零解压开销），当存在多帧且输出受 `max_out` 约束时，
 //!   跨多核并发解压各帧再按序拼装，保持单帧/异常路径与单线程语义完全一致。
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::dec::{DecompressOptions, State, decompress_with_state, parse_frame_header};
+use crate::dec::{
+    DecompressOptions, State, decompress_frame_into_slice, decompress_with_state,
+    parse_frame_header,
+};
 use crate::enc::{BLOCK, CompressOptions, EncCore};
 use crate::resources::{resolve_dec_threads, resolve_enc_threads};
 use crate::{Error, Result};
@@ -27,6 +30,18 @@ fn retain_slots(mt_slots: &mut Vec<Vec<u8>>, buf: Vec<u8>, retained_bytes: &mut 
         let mut b = buf;
         b.clear();
         mt_slots.push(b);
+    }
+}
+
+#[inline]
+fn tick_idle_states<T>(workers: &mut Vec<T>, mt_idle: &mut u8) {
+    if !workers.is_empty() {
+        *mt_idle = mt_idle.saturating_add(1);
+        if *mt_idle >= 8 {
+            workers.clear();
+            workers.shrink_to_fit();
+            *mt_idle = 0;
+        }
     }
 }
 
@@ -186,7 +201,8 @@ fn scan_frames(data: &[u8]) -> Result<Vec<FrameSpan>> {
                 .ok_or(Error::Corrupt("truncated skip frame"))?;
             let n = u32::from_le_bytes([sz[0], sz[1], sz[2], sz[3]]) as usize;
             pos = pos
-                .checked_add(4 + n)
+                .checked_add(4)
+                .and_then(|p| p.checked_add(n))
                 .filter(|&p| p <= data.len())
                 .ok_or(Error::Corrupt("skip frame size"))?;
             continue;
@@ -198,6 +214,8 @@ fn scan_frames(data: &[u8]) -> Result<Vec<FrameSpan>> {
         let fh = parse_frame_header(d)?;
         let block_max = fh.block_max();
         let mut p = fh.header_len;
+        let mut min_out = 0u64;
+        let mut max_out_bound = 0u64;
         loop {
             let h = d
                 .get(p..p + 3)
@@ -207,14 +225,16 @@ fn scan_frames(data: &[u8]) -> Result<Vec<FrameSpan>> {
             let last = v & 1 != 0;
             let size = v >> 3;
             match (v >> 1) & 3 {
-                0 | 2 => {
+                0 => {
                     if size > block_max {
-                        return Err(Error::Corrupt("block too large"));
+                        return Err(Error::Corrupt("raw block too large"));
                     }
                     p = p
                         .checked_add(size)
                         .filter(|&np| np <= d.len())
-                        .ok_or(Error::Corrupt("truncated block"))?;
+                        .ok_or(Error::Corrupt("truncated raw block"))?;
+                    min_out = min_out.saturating_add(size as u64);
+                    max_out_bound = max_out_bound.saturating_add(size as u64);
                 }
                 1 => {
                     if size > block_max {
@@ -224,12 +244,29 @@ fn scan_frames(data: &[u8]) -> Result<Vec<FrameSpan>> {
                         .checked_add(1)
                         .filter(|&np| np <= d.len())
                         .ok_or(Error::Corrupt("truncated rle block"))?;
+                    min_out = min_out.saturating_add(size as u64);
+                    max_out_bound = max_out_bound.saturating_add(size as u64);
+                }
+                2 => {
+                    if size < 2 || size > block_max {
+                        return Err(Error::Corrupt("block too large"));
+                    }
+                    p = p
+                        .checked_add(size)
+                        .filter(|&np| np <= d.len())
+                        .ok_or(Error::Corrupt("truncated block"))?;
+                    max_out_bound = max_out_bound.saturating_add(block_max as u64);
                 }
                 _ => return Err(Error::Corrupt("reserved block type")),
             }
             if last {
                 break;
             }
+        }
+        if let Some(u) = fh.uncomp_len
+            && (u < min_out || u > max_out_bound)
+        {
+            return Err(Error::Corrupt("frame content size mismatch"));
         }
         if fh.checksum {
             p = p
@@ -247,11 +284,9 @@ fn scan_frames(data: &[u8]) -> Result<Vec<FrameSpan>> {
     Ok(spans)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn decompress_parallel(
     state: &mut State,
     mt_states: &mut Vec<Box<State>>,
-    mt_slots: &mut Vec<Vec<u8>>,
     mt_idle: &mut u8,
     data: &[u8],
     out: &mut Vec<u8>,
@@ -260,16 +295,16 @@ pub(crate) fn decompress_parallel(
 ) -> Result<()> {
     let workers = resolve_dec_threads(opts.threads);
     if workers <= 1 {
-        tick_idle_vec(mt_states, mt_slots, mt_idle);
+        tick_idle_states(mt_states, mt_idle);
         return decompress_with_state(state, data, out, max_out);
     }
     let Ok(spans) = scan_frames(data) else {
         // 出错回退给单线程以保持前缀已解码块及精确错误码。
-        tick_idle_vec(mt_states, mt_slots, mt_idle);
+        tick_idle_states(mt_states, mt_idle);
         return decompress_with_state(state, data, out, max_out);
     };
     if spans.len() < 2 {
-        tick_idle_vec(mt_states, mt_slots, mt_idle);
+        tick_idle_states(mt_states, mt_idle);
         return decompress_with_state(state, data, out, max_out);
     }
 
@@ -283,11 +318,13 @@ pub(crate) fn decompress_parallel(
     let avail = max_out.saturating_sub(out.len());
     let Some(total) = known_total else {
         // 含未声明 Frame_Content_Size 的帧时无法提前分配全局预算，直接回退单线程以确保 <= max_out。
-        tick_idle_vec(mt_states, mt_slots, mt_idle);
+        tick_idle_states(mt_states, mt_idle);
         return decompress_with_state(state, data, out, max_out);
     };
-    if total > avail || total < 256 * 1024 {
-        tick_idle_vec(mt_states, mt_slots, mt_idle);
+    // 防伪造头 OOM：总声明解压尺寸超过输入 256 倍且 > 32 MiB 时退回单线程按块流式校验。
+    let safe_cap = data.len().saturating_mul(256).max(32 << 20);
+    if total > avail || total < 256 * 1024 || total > safe_cap {
+        tick_idle_states(mt_states, mt_idle);
         return decompress_with_state(state, data, out, max_out);
     }
     *mt_idle = 0;
@@ -298,33 +335,44 @@ pub(crate) fn decompress_parallel(
         mt_states.resize_with(active - 1, || Box::new(State::new()));
     }
 
-    let slots: Vec<Mutex<(Vec<u8>, Result<()>)>> = (0..nframes)
-        .map(|_| {
-            let mut b = mt_slots.pop().unwrap_or_default();
-            b.clear();
-            Mutex::new((b, Ok(())))
-        })
-        .collect();
+    // 零拷贝直接切片并行解码：通过 `split_at_mut` 将目标输出缓冲按帧切分为互不重叠的 `&mut [u8]`，
+    // 消除每帧临时 Vec 分配、高水位滞留与收尾单线程 200+ MB 顺序 memcpy（Amdahl 定律串行瓶颈）。
+    let orig_len = out.len();
+    if orig_len == 0 && out.capacity() < total {
+        *out = vec![0u8; total];
+    } else {
+        out.resize(orig_len + total, 0);
+    }
+
+    let mut slice_slots: Vec<Mutex<Option<&mut [u8]>>> = Vec::with_capacity(nframes);
+    let mut rem_slice = &mut out[orig_len..orig_len + total];
+    for sp in &spans {
+        let frame_len = sp.uncomp_len.expect("checked known") as usize;
+        let (head, tail) = rem_slice.split_at_mut(frame_len);
+        slice_slots.push(Mutex::new(Some(head)));
+        rem_slice = tail;
+    }
+
     let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
     let run_worker = |st: &mut State| {
-        let mut tmp = Vec::new();
         loop {
+            if failed.load(Ordering::Relaxed) {
+                break;
+            }
             let idx = next.fetch_add(1, Ordering::Relaxed);
             if idx >= nframes {
                 break;
             }
-            {
-                let mut guard = slots[idx].lock().unwrap_or_else(|e| e.into_inner());
-                std::mem::swap(&mut tmp, &mut guard.0);
-            }
-            tmp.clear();
-            let sp = &spans[idx];
-            let frame_cap = sp.uncomp_len.expect("checked known") as usize;
-            let res = decompress_with_state(st, &data[sp.start..sp.end], &mut tmp, frame_cap);
-            {
-                let mut guard = slots[idx].lock().unwrap_or_else(|e| e.into_inner());
-                std::mem::swap(&mut tmp, &mut guard.0);
-                guard.1 = res;
+            let slice_opt = {
+                let mut guard = slice_slots[idx].lock().unwrap_or_else(|e| e.into_inner());
+                guard.take()
+            };
+            if let Some(dst_slice) = slice_opt {
+                let sp = &spans[idx];
+                if decompress_frame_into_slice(st, &data[sp.start..sp.end], dst_slice).is_err() {
+                    failed.store(true, Ordering::Relaxed);
+                }
             }
         }
     };
@@ -337,33 +385,10 @@ pub(crate) fn decompress_parallel(
         run_worker(state);
     });
 
-    let mut total_out = 0usize;
-    let mut ok = true;
-    for slot in &slots {
-        let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.1.is_err() {
-            ok = false;
-            break;
-        }
-        if let Some(next_total) = total_out.checked_add(guard.0.len()) {
-            total_out = next_total;
-        } else {
-            ok = false;
-            break;
-        }
-    }
-    if !ok || out.len().saturating_add(total_out) > max_out {
-        // 异常或超限路径不保留临时槽位缓冲，避免高水位内存滞留。
-        drop(slots);
+    if failed.load(Ordering::Relaxed) {
+        // 异常路径回滚长度并退回单线程，严格保持前缀完整块与精确错误码。
+        out.truncate(orig_len);
         return decompress_with_state(state, data, out, max_out);
-    }
-
-    out.reserve(total_out);
-    let mut retained_bytes: usize = mt_slots.iter().map(Vec::capacity).sum();
-    for slot in slots {
-        let (buf, _) = slot.into_inner().unwrap_or_else(|e| e.into_inner());
-        out.extend_from_slice(&buf);
-        retain_slots(mt_slots, buf, &mut retained_bytes);
     }
     Ok(())
 }
